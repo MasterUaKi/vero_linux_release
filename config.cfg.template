@@ -1,0 +1,30 @@
+[DSPACE]
+base_url = http://vero-test.uni-vechta.de/server/api
+bot_email = riabtsev.olehde@gmail.com
+bot_password = YOUR_PASSWORD_HERE
+
+[D3DMS]
+url = https://ecm-apps-test.uni-vechta.de
+api_key = YOUR_API_KEY_HERE
+repo_id = f1e1b294-5602-5d8e-8985-e6d0c944b113
+folder_application = 009
+folder_funding = 002
+
+[PATHS]
+t_drive_dir = generated_pdf_meldebogen
+
+[D3_DEFAULTS]
+zda = Nein
+aussonderung = B
+aufbewahrungsfrist = 120
+vero_status = Antrag_eingegangen
+
+[SETTINGS]
+poll_interval_seconds = 360
+language = de
+
+[LOGGING]
+log_dir = logs
+log_filename = vero_integration.log
+backup_count = 30
+

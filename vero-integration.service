@@ -1,0 +1,21 @@
+[Unit]
+Description=VeRO Integration Service (DSpace to d.3 DMS)
+After=network.target
+
+[Service]
+Type=simple
+User=vero-bot
+Group=vero-bot
+WorkingDirectory=/opt/vero-integration/app
+# Запуск строго через интерпретатор внутри виртуального окружения
+ExecStart=/opt/vero-integration/.venv/bin/python dspace_pool_pdf_batch_processor_input.py
+# Автоматический перезапуск в случае непредвиденного падения
+Restart=on-failure
+RestartSec=10
+# Перенаправление вывода в системный журнал Linux
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=vero-bot
+
+[Install]
+WantedBy=multi-user.target
