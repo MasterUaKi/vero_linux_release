@@ -1,12 +1,12 @@
 # ==============================================================================
 # Script Name: dspace_pool_pdf_batch_processor_input.py
-# Version:     4.2.0
-# Date:        2026-08-10
+# Version:     4.4.0
+# Date:        2026-08-13
 # Author:      Oleh Riabtsev / AI Assistant
 # Description: Continuous Daemon Mode with i18n and UUID extraction from authority.
-#              FIXED: Conditional claiming. A task is now claimed ONLY if the
-#              document upload to d.3 DMS was successful (or already exists).
-#              Otherwise, it remains in the pool for future retry.
+#              FIXED: Multi-document status resolution in folders. Now intelligently
+#              scans ALL files in a folder and prioritizes decisive statuses
+#              (Praesidium_Ja / Nein) over empty/UNBEKANNT attachments.
 # ==============================================================================
 
 import json
@@ -169,7 +169,14 @@ def process_live_workflow():
                 if app_aktenzeichen != "UNBEKANNT":
                     app_files = search_antrag_files_in_d3(d3_client, app_aktenzeichen, app_akte_id)
                     if app_files:
-                        app_status_in_d3 = app_files[0].get("vero_status_515", "UNBEKANNT")
+                        # УМНЫЙ ПОИСК СТАТУСА (Фаза 1)
+                        statuses = [f.get("vero_status_515", "UNBEKANNT") for f in app_files]
+                        active = [s for s in statuses if s and s != "UNBEKANNT"]
+                        if active:
+                            decision = next(
+                                (s for s in active if "praesidium_ja" in s.lower() or "praesidium_nein" in s.lower()),
+                                None)
+                            app_status_in_d3 = decision if decision else active[0]
 
                 logging.info(t("PARENT_STATUS", status=app_status_in_d3))
 
@@ -198,7 +205,7 @@ def process_live_workflow():
                 title=project_title
             )
 
-            # ФЛАГ УСПЕШНОЙ ЗАГРУЗКИ (для алгоритма claim)
+            # ФЛАГ УСПЕШНОЙ ЗАГРУЗКИ
             upload_success = False
 
             if pdf_created and d3_authenticated and location_url:
@@ -221,7 +228,7 @@ def process_live_workflow():
                         if doc_location:
                             upload_success = True
 
-            # ПРИНЯТИЕ ЗАДАЧИ БОТОМ (CLAIM) ТОЛЬКО ПРИ УСПЕХЕ
+            # ПРИНЯТИЕ ЗАДАЧИ БОТОМ
             if upload_success:
                 scanner.claim_pool_task(pooltask_id)
             else:
@@ -280,8 +287,21 @@ def process_live_workflow():
                         if f.get("vorgangszeichen", "").endswith(f"/{target_folder_code}")
                     ]
 
+                    # 🔥 УМНЫЙ ПОИСК СТАТУСА (Учитывает сразу несколько документов в папке)
                     if matching_files:
-                        doc_status_in_d3 = matching_files[0].get("vero_status_515", "UNBEKANNT")
+                        all_statuses = [f.get("vero_status_515", "UNBEKANNT") for f in matching_files]
+                        # Убираем пустые и UNBEKANNT
+                        active_statuses = [s for s in all_statuses if s and s != "UNBEKANNT"]
+
+                        if active_statuses:
+                            # 1 приоритет: Ищем, есть ли финальное решение (Ja / Nein)
+                            decision = next((s for s in active_statuses if
+                                             "praesidium_ja" in s.lower() or "praesidium_nein" in s.lower()), None)
+                            if decision:
+                                doc_status_in_d3 = decision
+                            else:
+                                # 2 приоритет: Берем любой активный промежуточный статус
+                                doc_status_in_d3 = active_statuses[0]
 
             status_clean = doc_status_in_d3.strip().lower()
             logging.info(t("DOC_STATUS_IN_D3", entity_type=entity_type,

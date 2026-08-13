@@ -1,182 +1,141 @@
 # ==============================================================================
 # Script Name: d3_dspace_status_checker.py
-# Version:     1.1.0
-# Date:        2026-07-27
+# Version:     2.0.0 (FINAL)
+# Date:        2026-08-13
 # Author:      Oleh Riabtsev / AI Assistant
-# Description: Read-Only Audit Tool with strict DDRIT document filtering.
-#              Excludes parent Akte objects from search results.
+# Description: Helper module to search and check document status (field 515/verostat)
+#              FIXED: Removed strict DDRIT category filtering which caused false negatives.
+#              Now filters exclusively by target Vorgangszeichen (/009 and /002).
 # ==============================================================================
 
 import json
 import logging
+import time
 import requests
 
-from dspace_scan_pool_details import DSpacePoolScanner
 from d3_api_client import D3DMSClient
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s'
-)
-
-# === КОНФИГУРАЦИЯ ===
-DSPACE_BASE_URL = "http://vero-test.uni-vechta.de/server/api"
-BOT_EMAIL = "riabtsev.olehde@gmail.com"
-BOT_PASSWORD = "12345abc"
-
-D3_URL = "https://ecm-apps-test.uni-vechta.de"
-D3_API_KEY = "ngjRHFXyGGhh+YOeJHswye5bFoMWIC7xvA4fXWIoSHTW4A6PPiV8gujh3u+9KMP2nEGP9Gp7pGE9FoL2HBvDlQweJ2pfQYYLPim96yJnCUYhqD8fFft+jNhqOvH7nGHM&_z_A0V5ayCTQmI1n_IMf365T7Q2iMpfY2OJqTNz9myIfoSF-EHOGlm6yxBq86pcJLAa_41Clh72ASKNancMaat9HVxN1gbxC"
-D3_REPO_ID = "f1e1b294-5602-5d8e-8985-e6d0c944b113"
+try:
+    from config_loader import D3_REQUEST_DELAY
+except ImportError:
+    D3_REQUEST_DELAY = 1.0
 
 
-def get_field_515_from_d3_object(d3_client: D3DMSClient, doc_id: str) -> dict:
-    """Извлекает значение поля 515 (Vero_Status) и категорию объекта d.3."""
+def get_all_properties(data_dict: dict) -> list:
+    """Агрессивно собирает все свойства из разных структур d.3 JSON"""
+    props = []
+    if isinstance(data_dict.get("properties"), list):
+        props.extend(data_dict["properties"])
+    if isinstance(data_dict.get("objectProperties"), list):
+        props.extend(data_dict["objectProperties"])
+
+    source_props = data_dict.get("sourceProperties")
+    if isinstance(source_props, dict):
+        sp = source_props.get("properties")
+        if isinstance(sp, list):
+            props.extend(sp)
+
+    return props
+
+
+def extract_status_515_from_props(props: list) -> str:
+    """Извлекает значение поля 515 (verostat / Vero_Status)."""
+    if not props: return ""
+    target_keys = {"515", "verostat", "vero_status", "verostatus"}
+
+    for p in props:
+        if not isinstance(p, dict): continue
+
+        p_id = str(p.get("id", "")).strip().lower()
+        p_key = str(p.get("key", "")).strip().lower()
+        p_name = str(p.get("name", "")).strip().lower()
+
+        if p_id in target_keys or p_key in target_keys or p_name in target_keys:
+            vals = p.get("values")
+            if vals and isinstance(vals, list) and len(vals) > 0 and vals[0]:
+                return str(vals[0]).strip()
+            val = p.get("value")
+            if val:
+                return str(val).strip()
+    return ""
+
+
+def get_details_from_d3_object(d3_client: D3DMSClient, doc_id: str) -> dict:
+    """Точечный запрос свойств объекта, если они отсутствовали в общем поиске."""
     url = f"{d3_client.base_url}/dms/r/{d3_client.repo_id}/o2/{doc_id}"
-    result = {"status_515": "Не найдено", "category": "Неизвестно"}
+    result = {"status_515": "", "vorgangszeichen": ""}
 
     try:
+        time.sleep(D3_REQUEST_DELAY)
         resp = requests.get(url, headers=d3_client.headers)
         if resp.status_code == 200:
             data = resp.json()
+            props = get_all_properties(data)
 
-            # Извлекаем категорию объекта
-            result["category"] = data.get("sourceCategory") or data.get("objectDefinitionId") or "Неизвестно"
-
-            props = data.get("objectProperties", []) or data.get("properties", [])
             for p in props:
-                p_id = str(p.get("id") or p.get("key"))
-                if p_id == "515":
-                    vals = p.get("values")
-                    if vals and isinstance(vals, list) and len(vals) > 0:
-                        result["status_515"] = vals[0]
-                    elif p.get("value"):
-                        result["status_515"] = p.get("value")
-                    break
+                p_id = str(p.get("id") or p.get("key") or p.get("name")).strip().lower()
+                if p_id in ["12", "vorgangszeichen"]:
+                    vals = p.get("values") or [p.get("value")]
+                    if vals and vals[0]:
+                        result["vorgangszeichen"] = str(vals[0])
+
+            result["status_515"] = extract_status_515_from_props(props)
+
     except Exception as e:
-        result["status_515"] = f"Ошибка: {str(e)}"
+        logging.debug(f"Ошибка получения деталей объекта {doc_id}: {e}")
 
     return result
 
 
 def search_antrag_files_in_d3(d3_client: D3DMSClient, aktenzeichen: str, akte_id: str) -> list:
-    """
-    Ищет файлы в папке 'Antrag' (/009) по Vorgangszeichen = [Aktenzeichen]/009.
-    Исключает саму Акту и фильтрует только документы категории DDRIT.
-    """
-    vorgangszeichen = f"{aktenzeichen}/009"
-    url = f"{d3_client.base_url}/dms/r/{d3_client.repo_id}/sr/"
-    params = {"fulltext": vorgangszeichen}
+    """Ищет документы в целевых папках (/009 и /002) Акты."""
+    if not aktenzeichen or aktenzeichen == "UNBEKANNT": return []
 
+    url = f"{d3_client.base_url}/dms/r/{d3_client.repo_id}/sr/"
+    params = {"fulltext": aktenzeichen}
     found_documents = []
 
     try:
+        time.sleep(D3_REQUEST_DELAY)
         resp = requests.get(url, headers=d3_client.headers, params=params)
+
         if resp.status_code == 200:
             data = resp.json()
             items = data.get("_embedded", {}).get("items", []) or data.get("items", [])
 
             for item in items:
                 doc_href = item.get("_links", {}).get("self", {}).get("href", "")
-                doc_id = item.get("id") or doc_href.split("/")[-1]
+                doc_id = item.get("id") or doc_href.split("/")[-1].split("?")[0]
 
-                # Игнорируем саму Акту
-                if doc_id == akte_id:
-                    continue
+                if akte_id and doc_id == akte_id:
+                    continue  # Пропускаем саму Акту
 
-                # Получаем детали и поле 515
-                doc_info = get_field_515_from_d3_object(d3_client, doc_id)
+                props = get_all_properties(item)
+                status_515 = extract_status_515_from_props(props)
 
-                found_documents.append({
-                    "doc_id": doc_id,
-                    "doc_name": item.get("displayName") or item.get("title") or "Meldebogen PDF",
-                    "category": doc_info["category"],
-                    "vero_status_515": doc_info["status_515"]
-                })
+                vorgangszeichen = ""
+                for p in props:
+                    p_id = str(p.get("id") or p.get("key") or p.get("name")).strip().lower()
+                    if p_id in ["12", "vorgangszeichen"]:
+                        vals = p.get("values") or [p.get("value")]
+                        if vals and vals[0]:
+                            vorgangszeichen = str(vals[0])
+
+                # Делаем точечный запрос, только если свойств не было в общем поиске
+                if not status_515 or not vorgangszeichen:
+                    doc_info = get_details_from_d3_object(d3_client, doc_id)
+                    if not status_515: status_515 = doc_info["status_515"]
+                    if not vorgangszeichen: vorgangszeichen = doc_info["vorgangszeichen"]
+
+                # 🔥 ГЛАВНЫЙ ФИЛЬТР: Берем только объекты из папок /009 и /002
+                if vorgangszeichen and (vorgangszeichen.endswith("/009") or vorgangszeichen.endswith("/002")):
+                    found_documents.append({
+                        "doc_id": doc_id,
+                        "vorgangszeichen": vorgangszeichen,
+                        "vero_status_515": status_515 or "UNBEKANNT"
+                    })
+
     except Exception as e:
-        logging.error(f"[-] Ошибка поиска файлов в папке Antrag: {str(e)}")
+        logging.error(f"[-] Ошибка поиска файлов в d.3 DMS: {str(e)}")
 
     return found_documents
-
-
-def run_full_dspace_d3_audit():
-    print("\n==========================================================================")
-    print("🔍 ИНСПЕКЦИЯ: ПРОВЕРКА СТАТУСОВ ДОКУМЕНТОВ VERO (ПОЛЕ 515) В d.3 DMS")
-    print("==========================================================================")
-
-    # 1. Логин в DSpace
-    scanner = DSpacePoolScanner(DSPACE_BASE_URL)
-    if not scanner.login(BOT_EMAIL, BOT_PASSWORD):
-        logging.error("Не удалось авторизоваться в DSpace!")
-        return
-
-    # 2. Сканирование пула DSpace
-    pool_summary = scanner.scan_full_pool()
-    if not pool_summary or pool_summary.get("total_tasks_in_pool", 0) == 0:
-        logging.warning("В пуле DSpace нет активных задач.")
-        return
-
-    pool_tasks = pool_summary.get("pool_tasks", [])
-    print(f"\n📊 Найдено {len(pool_tasks)} активных заявок в пуле DSpace.\n")
-
-    # 3. Логин в d.3 DMS
-    d3_client = D3DMSClient(D3_URL, D3_API_KEY, D3_REPO_ID)
-    if not d3_client.login():
-        logging.error("Не удалось авторизоваться в d.3 DMS!")
-        return
-
-    print("-" * 80)
-
-    # 4. Проход по всем заявкам пула
-    for idx, task in enumerate(pool_tasks, start=1):
-        wf_details = task.get("workflow_item_details", {})
-        item_info = wf_details.get("item_info", {})
-        vero_id = item_info.get("uuid") or str(wf_details.get("workflow_item_id"))
-
-        metadata = wf_details.get("metadata", {})
-        project_title = metadata.get("dc.title", ["Без названия"])[0]
-
-        print(f"\n[{idx}/{len(pool_tasks)}] 📋 Заявка DSpace: '{project_title}'")
-        print(f"    🆔 Vero_ID (UUID): {vero_id}")
-
-        # Поиск Акты в d.3 DMS
-        location_url = d3_client.find_akte_by_vero_id(vero_id)
-
-        if not location_url:
-            print(f"    ❌ Акта в d.3 DMS: НЕ НАЙДЕНА")
-            continue
-
-        # Извлекаем чистое ID Акты
-        akte_id = location_url.split("/")[-1].split("?")[0]
-        print(f"    ✅ Акта в d.3 DMS: СУЩЕСТВУЕТ (ID Акты: {akte_id})")
-
-        # Получаем Aktenzeichen
-        aktenzeichen = d3_client.get_aktenzeichen(location_url)
-        print(f"    🔑 Aktenzeichen: {aktenzeichen}")
-
-        if aktenzeichen == "UNBEKANNT":
-            print(f"    ⚠️ Не удалось извлечь Aktenzeichen.")
-            continue
-
-        # Проверяем папку "Antrag" (/009)
-        antrag_vorgangszeichen = f"{aktenzeichen}/009"
-        print(f"    📂 Проверка папки 'Antrag' ({antrag_vorgangszeichen})...")
-
-        files = search_antrag_files_in_d3(d3_client, aktenzeichen, akte_id)
-
-        if not files:
-            print(f"    📭 Файлы в папке 'Antrag': ОТСУТСТВУЮТ")
-        else:
-            print(f"    📄 Найдено документов (DDRIT) в папке 'Antrag': {len(files)}")
-            for f_idx, doc in enumerate(files, start=1):
-                print(f"       [{f_idx}] ID Документа : {doc['doc_id']}")
-                print(f"           Категория   : {doc['category']}")
-                print(f"           Название    : {doc['doc_name']}")
-                print(f"           🎯 ПОЛЕ 515 (Vero_Status): >>> {doc['vero_status_515']} <<<")
-
-    print("\n==========================================================================")
-    print("🏁 ИНСПЕКЦИЯ ЗАВЕРШЕНА")
-    print("==========================================================================\n")
-
-
-if __name__ == "__main__":
-    run_full_dspace_d3_audit()
