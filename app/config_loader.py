@@ -1,10 +1,10 @@
 # ==============================================================================
 # Script Name: config_loader.py
-# Version:     1.3.0
-# Date:        2026-08-12
+# Version:     1.4.0
+# Date:        2026-08-13
 # Author:      Oleh Riabtsev / AI Assistant
 # Description: Centralized configuration loader for VeRO Integration Service.
-#              UPDATED: Added independent rate-limiting delays for DSpace & d.3 API.
+#              UPDATED: Added multi-language support parameter (ru, en, de).
 # ==============================================================================
 
 import configparser
@@ -35,6 +35,7 @@ else:
         "request_delay": "1.5"
     }
     config["SERVICE"] = {
+        "language": "de",
         "poll_interval_seconds": "360",
         "t_drive_dir": "generated_pdf_meldebogen",
         "log_dir": "logs",
@@ -57,6 +58,7 @@ D3_FOLDER_FUNDING = config.get("D3DMS", "folder_funding", fallback="002")
 D3_REQUEST_DELAY = config.getfloat("D3DMS", "request_delay", fallback=1.5)
 
 # --- Service parameters ---
+LANGUAGE = config.get("SERVICE", "language", fallback="de").strip().lower()
 POLL_INTERVAL_SECONDS = config.getint("SERVICE", "poll_interval_seconds", fallback=360)
 T_DRIVE_DIR = config.get("SERVICE", "t_drive_dir", fallback="generated_pdf_meldebogen")
 LOG_DIR = config.get("SERVICE", "log_dir", fallback="logs")
