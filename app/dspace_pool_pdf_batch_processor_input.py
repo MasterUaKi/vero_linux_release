@@ -1,12 +1,11 @@
 # ==============================================================================
 # Script Name: dspace_pool_pdf_batch_processor_input.py
-# Version:     4.4.0
+# Version:     4.5.0
 # Date:        2026-08-13
 # Author:      Oleh Riabtsev / AI Assistant
 # Description: Continuous Daemon Mode with i18n and UUID extraction from authority.
-#              FIXED: Multi-document status resolution in folders. Now intelligently
-#              scans ALL files in a folder and prioritizes decisive statuses
-#              (Praesidium_Ja / Nein) over empty/UNBEKANNT attachments.
+#              FIXED: Added 'kostenstelle_vergeben' as a valid final approval status
+#              for Funding workflows, alongside 'praesidium_ja'.
 # ==============================================================================
 
 import json
@@ -94,9 +93,10 @@ def get_linked_application_uuid(wf_details: dict) -> str:
     return ""
 
 
-def is_praesidium_approved(status_string: str) -> bool:
+def is_final_approved(status_string: str) -> bool:
+    """Check if the status is a final approval (either Praesidium or Kostenstelle)."""
     status_clean = str(status_string).strip().lower()
-    return "praesidium_ja" in status_clean
+    return "praesidium_ja" in status_clean or "kostenstelle_vergeben" in status_clean
 
 
 def process_live_workflow():
@@ -169,18 +169,18 @@ def process_live_workflow():
                 if app_aktenzeichen != "UNBEKANNT":
                     app_files = search_antrag_files_in_d3(d3_client, app_aktenzeichen, app_akte_id)
                     if app_files:
-                        # УМНЫЙ ПОИСК СТАТУСА (Фаза 1)
+                        # УМНЫЙ ПОИСК СТАТУСА (Фаза 1) - добавили kostenstelle_vergeben
                         statuses = [f.get("vero_status_515", "UNBEKANNT") for f in app_files]
                         active = [s for s in statuses if s and s != "UNBEKANNT"]
                         if active:
-                            decision = next(
-                                (s for s in active if "praesidium_ja" in s.lower() or "praesidium_nein" in s.lower()),
-                                None)
+                            decision = next((s for s in active if
+                                             "praesidium_ja" in s.lower() or "praesidium_nein" in s.lower() or "kostenstelle_vergeben" in s.lower()),
+                                            None)
                             app_status_in_d3 = decision if decision else active[0]
 
                 logging.info(t("PARENT_STATUS", status=app_status_in_d3))
 
-                if not is_praesidium_approved(app_status_in_d3):
+                if not is_final_approved(app_status_in_d3):
                     logging.info(t("WAITING_PRAESIDIUM", app_uuid=linked_app_uuid, status=app_status_in_d3))
                     continue
 
@@ -287,16 +287,16 @@ def process_live_workflow():
                         if f.get("vorgangszeichen", "").endswith(f"/{target_folder_code}")
                     ]
 
-                    # 🔥 УМНЫЙ ПОИСК СТАТУСА (Учитывает сразу несколько документов в папке)
+                    # 🔥 УМНЫЙ ПОИСК СТАТУСА - добавили kostenstelle_vergeben
                     if matching_files:
                         all_statuses = [f.get("vero_status_515", "UNBEKANNT") for f in matching_files]
-                        # Убираем пустые и UNBEKANNT
                         active_statuses = [s for s in all_statuses if s and s != "UNBEKANNT"]
 
                         if active_statuses:
-                            # 1 приоритет: Ищем, есть ли финальное решение (Ja / Nein)
+                            # 1 приоритет: Ищем, есть ли финальное решение
                             decision = next((s for s in active_statuses if
-                                             "praesidium_ja" in s.lower() or "praesidium_nein" in s.lower()), None)
+                                             "praesidium_ja" in s.lower() or "praesidium_nein" in s.lower() or "kostenstelle_vergeben" in s.lower()),
+                                            None)
                             if decision:
                                 doc_status_in_d3 = decision
                             else:
@@ -308,7 +308,8 @@ def process_live_workflow():
                            folder_code=(D3_FOLDER_FUNDING if is_funding else D3_FOLDER_APPLICATION),
                            status=doc_status_in_d3))
 
-            if "praesidium_ja" in status_clean:
+            # Обработка успешных финальных статусов
+            if "praesidium_ja" in status_clean or "kostenstelle_vergeben" in status_clean:
                 if "kommentar" in status_clean or "auflagen" in status_clean:
                     logging.info(t("APPROVED_WITH_COMMENT", entity_type=entity_type))
                 else:
@@ -316,6 +317,7 @@ def process_live_workflow():
 
                 scanner.approve_claimed_task(claimedtask_id)
 
+            # Обработка отклонения
             elif "praesidium_nein" in status_clean:
                 logging.info(t("REJECTED", entity_type=entity_type))
                 scanner.reject_claimed_task(claimedtask_id, reason=t("REJECT_REASON"))

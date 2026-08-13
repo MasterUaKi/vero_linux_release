@@ -1,24 +1,18 @@
 # ==============================================================================
 # Script Name: d3_dspace_status_checker.py
-# Version:     2.0.0 (FINAL)
+# Version:     2.1.0
 # Date:        2026-08-13
 # Author:      Oleh Riabtsev / AI Assistant
-# Description: Helper module to search and check document status (field 515/verostat)
-#              FIXED: Removed strict DDRIT category filtering which caused false negatives.
-#              Now filters exclusively by target Vorgangszeichen (/009 and /002).
+# Description: Helper module to search and check document status in d.3 DMS.
+#              FIXED: Removed artificial request delay on GET queries to speed up
+#              in-cycle dossier scanning from 32s down to 1-2s per task.
 # ==============================================================================
 
 import json
 import logging
-import time
 import requests
 
 from d3_api_client import D3DMSClient
-
-try:
-    from config_loader import D3_REQUEST_DELAY
-except ImportError:
-    D3_REQUEST_DELAY = 1.0
 
 
 def get_all_properties(data_dict: dict) -> list:
@@ -61,13 +55,13 @@ def extract_status_515_from_props(props: list) -> str:
 
 
 def get_details_from_d3_object(d3_client: D3DMSClient, doc_id: str) -> dict:
-    """Точечный запрос свойств объекта, если они отсутствовали в общем поиске."""
+    """Точечный запрос свойств объекта без искусственных задержек."""
     url = f"{d3_client.base_url}/dms/r/{d3_client.repo_id}/o2/{doc_id}"
     result = {"status_515": "", "vorgangszeichen": ""}
 
     try:
-        time.sleep(D3_REQUEST_DELAY)
-        resp = requests.get(url, headers=d3_client.headers)
+        # Без time.sleep: быстрый GET-запрос
+        resp = requests.get(url, headers=d3_client.headers, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
             props = get_all_properties(data)
@@ -96,8 +90,7 @@ def search_antrag_files_in_d3(d3_client: D3DMSClient, aktenzeichen: str, akte_id
     found_documents = []
 
     try:
-        time.sleep(D3_REQUEST_DELAY)
-        resp = requests.get(url, headers=d3_client.headers, params=params)
+        resp = requests.get(url, headers=d3_client.headers, params=params, timeout=10)
 
         if resp.status_code == 200:
             data = resp.json()
@@ -121,13 +114,13 @@ def search_antrag_files_in_d3(d3_client: D3DMSClient, aktenzeichen: str, akte_id
                         if vals and vals[0]:
                             vorgangszeichen = str(vals[0])
 
-                # Делаем точечный запрос, только если свойств не было в общем поиске
+                # Запрашиваем детали, только если в краткой карточке не хватило полей
                 if not status_515 or not vorgangszeichen:
                     doc_info = get_details_from_d3_object(d3_client, doc_id)
                     if not status_515: status_515 = doc_info["status_515"]
                     if not vorgangszeichen: vorgangszeichen = doc_info["vorgangszeichen"]
 
-                # 🔥 ГЛАВНЫЙ ФИЛЬТР: Берем только объекты из папок /009 и /002
+                # Фильтруем объекты только из папок /009 и /002
                 if vorgangszeichen and (vorgangszeichen.endswith("/009") or vorgangszeichen.endswith("/002")):
                     found_documents.append({
                         "doc_id": doc_id,
