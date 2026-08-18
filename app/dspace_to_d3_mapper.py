@@ -1,15 +1,18 @@
 # ==============================================================================
 # Script Name: dspace_to_d3_mapper.py
-# Version:     3.1.0
-# Date:        2026-08-03
+# Version:     3.2.0
+# Date:        2026-08-18
 # Author:      Oleh Riabtsev / AI Assistant
 # Description: Full field transformation module mapping DSpace-CRIS (VeRO)
 #              metadata to d.3 DMS properties payload and PDF generation schema.
-#              UPDATED: Integrated centralized default settings from config_loader.py.
+#              UPDATED: Added faculty name normalization (clean_faculty_name)
+#              and updated TYPE_CONFIG_MATRIX to strictly match d.3 DMS
+#              workflow routing requirements ('Fakultät I' / 'Fakultät II').
 # ==============================================================================
 
 import json
 import logging
+import re
 
 from config_loader import (
     DEFAULT_ZDA,
@@ -34,12 +37,12 @@ class DSpaceToD3Mapper:
         "FACULTY_1": {
             "display_name": "Application Faculty 1",
             "federfuehrende_oe": "Fakultät I",
-            "fakultaet_einrichtung": "Fakultät I - Bildungs- und Kulturwissenschaften",
+            "fakultaet_einrichtung": "Fakultät I",
         },
         "FACULTY_2": {
             "display_name": "Application Faculty 2",
             "federfuehrende_oe": "Fakultät II",
-            "fakultaet_einrichtung": "Fakultät II - Agrar- und Umweltwissenschaften",
+            "fakultaet_einrichtung": "Fakultät II",
         },
         "FUNDING": {
             "display_name": "Funding / Drittmittel",
@@ -52,6 +55,27 @@ class DSpaceToD3Mapper:
             "fakultaet_einrichtung": "Zentrale Einrichtung / Sonstige",
         }
     }
+
+    @classmethod
+    def clean_faculty_name(cls, raw_faculty: str) -> str:
+        """
+        Нормализует название факультета, отсекая расширенные суффиксы
+        (например, 'Fakultät I - Bildungs- und Kulturwissenschaften' -> 'Fakultät I'),
+        чтобы соответствовать строгому условию проверки в воркфлоу d.3 DMS.
+        """
+        if not raw_faculty:
+            return ""
+
+        val = str(raw_faculty).strip()
+
+        if re.search(r"Fakultät\s*(I\b|1\b)", val, re.IGNORECASE):
+            return "Fakultät I"
+        if re.search(r"Fakultät\s*(II\b|2\b)", val, re.IGNORECASE):
+            return "Fakultät II"
+        if re.search(r"Fakultät\s*(III\b|3\b)", val, re.IGNORECASE):
+            return "Fakultät III"
+
+        return val
 
     @staticmethod
     def _truncate_for_d3(val: str, max_len: int = 250) -> str:
@@ -83,7 +107,7 @@ class DSpaceToD3Mapper:
     @classmethod
     def build_aktenplanzeichen(cls, dspace_item_details: dict) -> str:
         """
-        Динамическое формирование Aktenplanzeichen по правилам Андреаса:
+        Динамическое формирование Aktenplanzeichen:
         - Antragsforschung: 11.01.0.[JAHR]
         - Auftragsforschung: 11.01.1.[JAHR]
         - Wissenschaftliche Weiterbildung: 11.01.2.[JAHR]
@@ -91,15 +115,14 @@ class DSpaceToD3Mapper:
         """
         metadata = dspace_item_details.get("metadata", {})
 
-        # Проверяем как Application, так и Funding поля типов финансирования
         funding_type = (
-                cls._extract_first(metadata, "veroAP.funding.type", "") or
-                cls._extract_first(metadata, "veroFU.funding.type", "")
+            cls._extract_first(metadata, "veroAP.funding.type", "") or
+            cls._extract_first(metadata, "veroFU.funding.type", "")
         ).lower()
 
         project_type = (
-                cls._extract_first(metadata, "veroAP.project.type", "") or
-                cls._extract_first(metadata, "veroFU.project.type", "")
+            cls._extract_first(metadata, "veroAP.project.type", "") or
+            cls._extract_first(metadata, "veroFU.project.type", "")
         ).lower()
 
         title = cls._extract_first(metadata, "dc.title", "").lower()
@@ -113,10 +136,10 @@ class DSpaceToD3Mapper:
         else:
             code = "0"
 
-        # Определение года (JAHR) из даты начала
         funding_start = (
-                cls._extract_first(metadata, "veroAP.funding.start", "") or
-                cls._extract_first(metadata, "oairecerif.funding.startDate", "")
+            cls._extract_first(metadata, "veroAP.funding.start", "") or
+            cls._extract_first(metadata, "oairecerif.funding.startDate", "") or
+            cls._extract_first(metadata, "dc.date.issued", "")
         )
         if len(funding_start) >= 4 and funding_start[:4].isdigit():
             year = funding_start[:4]
@@ -165,12 +188,19 @@ class DSpaceToD3Mapper:
 
         is_funding = (app_type == "FUNDING")
 
-        # Базовый словарь полей
+        raw_fakultaet = (
+            type_cfg["fakultaet_einrichtung"] or
+            cls._extract_first(metadata, "cris.entity.faculty", "") or
+            cls._extract_first(metadata, "veroAP.organizationUnit.FakI", "") or
+            cls._extract_first(metadata, "vero.OrgUnit", "")
+        )
+        cleaned_fakultaet = cls.clean_faculty_name(raw_fakultaet)
+
         fields = {
             "app_type": app_type,
             "app_type_display": type_cfg["display_name"],
             "federfuehrende_oe": type_cfg["federfuehrende_oe"],
-            "fakultaet_einrichtung": type_cfg["fakultaet_einrichtung"],
+            "fakultaet_einrichtung": cleaned_fakultaet,
             "aktenplanzeichen": dynamic_aktenplanzeichen,
 
             "vero_id": item_info.get("uuid") or str(wf_item_id),
@@ -183,7 +213,6 @@ class DSpaceToD3Mapper:
         }
 
         if is_funding:
-            # === ИЗВЛЕЧЕНИЕ ПОЛЕЙ ДЛЯ FUNDING ===
             fields.update({
                 "title": cls._extract_first(metadata, "dc.title", "Unbenannter Funding-Eintrag"),
                 "acronym": cls._extract_first(metadata, "oairecerif.acronym", ""),
@@ -225,7 +254,6 @@ class DSpaceToD3Mapper:
                 "embargo_lift": cls._extract_first(metadata, "veroFU.embargo.lift", ""),
             })
         else:
-            # === ИЗВЛЕЧЕНИЕ ПОЛЕЙ ДЛЯ APPLICATION ===
             fields.update({
                 "title": cls._extract_first(metadata, "dc.title", "Unbenannter Antrag"),
                 "acronym": cls._extract_first(metadata, "veroAP.acronym", ""),
@@ -249,9 +277,7 @@ class DSpaceToD3Mapper:
                 "consulting_researchdata": cls._extract_first(metadata, "veroAP.consulting.researchdata", ""),
 
                 "research_subject": cls._extract_first(metadata, "veroAP.research.subject", ""),
-                "crosssection_subject": cls._extract_first(metadata, "veroAP.crosssection.subject",
-                                                           "") or cls._extract_first(metadata,
-                                                                                     "veroAP.research.subject", ""),
+                "crosssection_subject": cls._extract_first(metadata, "veroAP.crosssection.subject", "") or cls._extract_first(metadata, "veroAP.research.subject", ""),
                 "subject_other": cls._extract_first(metadata, "veroAP.subject.other", ""),
                 "abstract": cls._extract_first(metadata, "veroAP.abstract", ""),
                 "personell_health_data": cls._extract_first(metadata, "veroAP.personellhealthData", ""),
@@ -352,7 +378,6 @@ class DSpaceToD3Mapper:
         is_funding = (app_type == "FUNDING")
 
         if is_funding:
-            # === СТРУКТУРА PDF ДЛЯ FUNDING (Bewilligung) ===
             return [
                 {
                     "group_name": "0 - Typ der Förderanzeige",
@@ -425,7 +450,6 @@ class DSpaceToD3Mapper:
                 }
             ]
         else:
-            # === СТРУКТУРА PDF ДЛЯ APPLICATION (Стандартная) ===
             if app_type == "FACULTY_1":
                 faculty_label = "Fakultät I"
                 faculty_value = ds["fak_i_unit"] or ds["org_unit"]
