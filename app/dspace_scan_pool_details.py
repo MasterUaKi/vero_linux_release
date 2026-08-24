@@ -1,12 +1,12 @@
 # ==============================================================================
 # Script Name: dspace_scan_pool_details.py
-# Version:     1.7.0
-# Date:        2026-08-12
+# Version:     1.8.0
+# Date:        2026-08-24
 # Author:      Oleh Riabtsev / AI Assistant
 # Description: Scanner for both unclaimed (pooltasks) and claimed (claimedtasks)
 #              workflow items in DSpace 7 REST API.
-#              UPDATED: Added API rate limiting (DSPACE_REQUEST_DELAY) to prevent
-#              server overload and blocks.
+#              UPDATED: Added update_item_metadata_field() using JSON PATCH to
+#              sync metadata (e.g. Kostenstelle) back to DSpace Items.
 # ==============================================================================
 
 import json
@@ -299,6 +299,10 @@ class DSpacePoolScanner:
             logging.error(f"[-] Exception claiming PoolTask ID={pooltask_id}: {str(e)}")
             return False
 
+    def claim_task(self, pooltask_id: str) -> bool:
+        """Алиас для claim_pool_task."""
+        return self.claim_pool_task(pooltask_id)
+
     def approve_claimed_task(self, claimedtask_id: str) -> bool:
         """6. Завершение (одобрение/approve) задачи claimedtask в DSpace."""
         url = f"{self.base_url}/workflow/claimedtasks/{claimedtask_id}"
@@ -338,4 +342,46 @@ class DSpacePoolScanner:
                 return False
         except Exception as e:
             logging.error(f"[-] Exception rejecting ClaimedTask ID={claimedtask_id}: {str(e)}")
+            return False
+
+    def update_item_metadata_field(self, item_uuid: str, field_name: str, value: str) -> bool:
+        """8. Обновление метаполя объекта (Item) в DSpace через JSON PATCH."""
+        if not item_uuid or not field_name or not value:
+            return False
+
+        url = f"{self.base_url}/core/items/{item_uuid}"
+        xsrf_cookie = self.session.cookies.get("DSPACE-XSRF-COOKIE")
+
+        headers = {
+            "Content-Type": "application/json"
+        }
+        if xsrf_cookie:
+            headers["X-XSRF-TOKEN"] = xsrf_cookie
+
+        patch_payload = [
+            {
+                "op": "add",
+                "path": f"/metadata/{field_name}",
+                "value": [
+                    {
+                        "value": str(value).strip(),
+                        "language": None,
+                        "authority": None,
+                        "confidence": -1
+                    }
+                ]
+            }
+        ]
+
+        try:
+            time.sleep(DSPACE_REQUEST_DELAY)
+            resp = self.session.patch(url, json=patch_payload, headers=headers)
+            if resp.status_code == 200:
+                logging.info(f"✅ Метаданные DSpace успешно обновлены: [{field_name} = '{value}'] (UUID: {item_uuid})")
+                return True
+            else:
+                logging.error(f"[-] Ошибка PATCH DSpace ({resp.status_code}): {resp.text}")
+                return False
+        except Exception as e:
+            logging.error(f"[-] Исключение при обновлении метаданных DSpace: {e}")
             return False

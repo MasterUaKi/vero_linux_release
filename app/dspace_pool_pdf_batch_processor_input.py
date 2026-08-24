@@ -1,11 +1,11 @@
 # ==============================================================================
 # Script Name: dspace_pool_pdf_batch_processor_input.py
-# Version:     4.5.0
-# Date:        2026-08-13
+# Version:     4.6.0
+# Date:        2026-08-24
 # Author:      Oleh Riabtsev / AI Assistant
 # Description: Continuous Daemon Mode with i18n and UUID extraction from authority.
-#              FIXED: Added 'kostenstelle_vergeben' as a valid final approval status
-#              for Funding workflows, alongside 'praesidium_ja'.
+#              UPDATED: Added automated back-sync of 'Kostenstelle' from d.3 DMS
+#              to DSpace metadata 'veroFU.resources.TypevecContribution' on final approval.
 # ==============================================================================
 
 import json
@@ -35,7 +35,9 @@ from dspace_scan_pool_details import DSpacePoolScanner
 from dspace_to_d3_mapper import DSpaceToD3Mapper
 from generate_pdf_report import VeROPDFGenerator
 from d3_api_client import D3DMSClient
-from d3_dspace_status_checker import search_antrag_files_in_d3
+from d3_dspace_status_checker import search_antrag_files_in_d3, get_details_from_d3_object
+
+TARGET_DSPACE_KOSTENSTELLE_FIELD = "veroFU.resources.TypevecContribution"
 
 
 def setup_logging():
@@ -274,6 +276,7 @@ def process_live_workflow():
 
             location_url = d3_client.find_akte_by_vero_id(target_uuid_for_akte)
             doc_status_in_d3 = "UNBEKANNT"
+            kostenstelle_val = ""
 
             if location_url:
                 akte_id = location_url.split("/")[-1].split("?")[0]
@@ -287,21 +290,30 @@ def process_live_workflow():
                         if f.get("vorgangszeichen", "").endswith(f"/{target_folder_code}")
                     ]
 
-                    # 🔥 УМНЫЙ ПОИСК СТАТУСА - добавили kostenstelle_vergeben
+                    # 🔥 УМНЫЙ ПОИСК СТАТУСА - поиск статуса и значения Kostenstelle
                     if matching_files:
                         all_statuses = [f.get("vero_status_515", "UNBEKANNT") for f in matching_files]
                         active_statuses = [s for s in all_statuses if s and s != "UNBEKANNT"]
 
                         if active_statuses:
-                            # 1 приоритет: Ищем, есть ли финальное решение
                             decision = next((s for s in active_statuses if
                                              "praesidium_ja" in s.lower() or "praesidium_nein" in s.lower() or "kostenstelle_vergeben" in s.lower()),
                                             None)
                             if decision:
                                 doc_status_in_d3 = decision
                             else:
-                                # 2 приоритет: Берем любой активный промежуточный статус
                                 doc_status_in_d3 = active_statuses[0]
+
+                        # Извлечение Kostenstelle из найденных файлов
+                        for f in matching_files:
+                            if f.get("kostenstelle"):
+                                kostenstelle_val = f["kostenstelle"]
+                                break
+
+                    # Если в свойствах документа Kostenstelle не найдена, проверяем свойства самой Акты
+                    if not kostenstelle_val:
+                        akte_details = get_details_from_d3_object(d3_client, akte_id)
+                        kostenstelle_val = akte_details.get("kostenstelle", "")
 
             status_clean = doc_status_in_d3.strip().lower()
             logging.info(t("DOC_STATUS_IN_D3", entity_type=entity_type,
@@ -314,6 +326,18 @@ def process_live_workflow():
                     logging.info(t("APPROVED_WITH_COMMENT", entity_type=entity_type))
                 else:
                     logging.info(t("APPROVED_SIMPLE", entity_type=entity_type))
+
+                # Обратная синхронизация Kostenstelle в DSpace VeRO
+                if kostenstelle_val:
+                    logging.info(f"🔢 Gefundene Kostenstelle in d.3: [{kostenstelle_val}]")
+                    item_target_uuid = item_info.get("uuid") or vero_id
+                    scanner.update_item_metadata_field(
+                        item_uuid=item_target_uuid,
+                        field_name=TARGET_DSPACE_KOSTENSTELLE_FIELD,
+                        value=kostenstelle_val
+                    )
+                else:
+                    logging.warning(f"⚠️ Статус '{doc_status_in_d3}', но значение Kostenstelle в d.3 не найдено.")
 
                 scanner.approve_claimed_task(claimedtask_id)
 
