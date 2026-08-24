@@ -1,11 +1,11 @@
 # ==============================================================================
 # Script Name: d3_dspace_status_checker.py
-# Version:     2.4.0
+# Version:     2.8.0
 # Date:        2026-08-24
 # Author:      Oleh Riabtsev / AI Assistant
 # Description: Helper module to search and check document status in d.3 DMS.
-#              UPDATED: Added fallback extraction of Kostenstelle from 'Aktentitel'
-#              property where d.3 workflow stores the cost center code.
+#              UPDATED: Added deep exhaustive full-JSON scan for DSpace UUID
+#              across all root fields, attachments, and metadata properties.
 # ==============================================================================
 
 import json
@@ -56,11 +56,21 @@ def extract_status_515_from_props(props: list) -> str:
     return ""
 
 
+def is_valid_kostenstelle(val: str) -> bool:
+    """Проверяет, что строка является реальным номером Kostenstelle, а не 36-значным UUID."""
+    if not val:
+        return False
+    val_clean = str(val).strip()
+    if len(val_clean) == 36 and val_clean.count("-") == 4:
+        return False  # Это UUID объекта, а не финансовый номер
+    return len(val_clean) >= 2
+
+
 def extract_kostenstelle_from_props(props: list) -> str:
     """
-    Извлекает значение Kostenstelle / SAP Abrechnungselement из свойств d.3.
+    Извлекает значение Kostenstelle / SAP Abrechnungselement из свойств d.3 документа.
     1. Проверяет профильные поля (Abrechnungselement, Abrechnungselemente, Kostenstelle, PSP-Element).
-    2. Если они пусты, читает значение из Aktentitel (куда воркфлоу d.3 помещает номер при согласовании).
+    2. Если они пусты, читает значение из Aktentitel документа (если оно не является UUID).
     """
     if not props:
         return ""
@@ -79,7 +89,7 @@ def extract_kostenstelle_from_props(props: list) -> str:
 
     fallback_keys = {"aktentitel"}
 
-    # 1. Поиск по профильным SAP/Kostenstelle полям
+    # 1. Поиск по профильным SAP-полям
     for p in props:
         if not isinstance(p, dict):
             continue
@@ -92,15 +102,15 @@ def extract_kostenstelle_from_props(props: list) -> str:
             vals = p.get("values")
             if vals and isinstance(vals, list) and len(vals) > 0 and vals[0]:
                 val_str = str(vals[0]).strip()
-                if val_str:
+                if is_valid_kostenstelle(val_str):
                     return val_str
             val = p.get("value")
             if val:
                 val_str = str(val).strip()
-                if val_str:
+                if is_valid_kostenstelle(val_str):
                     return val_str
 
-    # 2. Фолбэк на поле Aktentitel
+    # 2. Фолбэк на Aktentitel документа (с проверкой на отсутствие UUID)
     for p in props:
         if not isinstance(p, dict):
             continue
@@ -113,34 +123,66 @@ def extract_kostenstelle_from_props(props: list) -> str:
             vals = p.get("values")
             if vals and isinstance(vals, list) and len(vals) > 0 and vals[0]:
                 val_str = str(vals[0]).strip()
-                if val_str:
+                if is_valid_kostenstelle(val_str):
                     return val_str
             val = p.get("value")
             if val:
                 val_str = str(val).strip()
-                if val_str:
+                if is_valid_kostenstelle(val_str):
                     return val_str
 
     return ""
 
 
 def get_details_from_d3_object(d3_client: D3DMSClient, doc_id: str) -> dict:
-    """Точечный запрос свойств объекта d.3."""
+    """Точечный запрос свойств объекта d.3 со сбором полного контекста документа."""
     url = f"{d3_client.base_url}/dms/r/{d3_client.repo_id}/o2/{doc_id}"
-    result = {"status_515": "", "vorgangszeichen": "", "kostenstelle": ""}
+    result = {
+        "status_515": "",
+        "vorgangszeichen": "",
+        "kostenstelle": "",
+        "title": "",
+        "filename": "",
+        "vero_id": "",
+        "raw_text_dump": ""
+    }
 
     try:
         resp = requests.get(url, headers=d3_client.headers, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
+
+            # Сохраняем сериализованный JSON для глубокого полнотекстового поиска UUID
+            result["raw_text_dump"] = json.dumps(data).lower()
+
+            result["title"] = str(data.get("displayTitle") or data.get("title") or data.get("name") or "").strip()
+            result["filename"] = str(data.get("filename") or data.get("fileName") or "").strip()
+
             props = get_all_properties(data)
 
             for p in props:
-                p_id = str(p.get("id") or p.get("key") or p.get("name")).strip().lower()
-                if p_id in ["12", "vorgangszeichen"]:
-                    vals = p.get("values") or [p.get("value")]
-                    if vals and vals[0]:
-                        result["vorgangszeichen"] = str(vals[0])
+                p_id = str(p.get("id") or "").strip().lower()
+                p_key = str(p.get("key") or "").strip().lower()
+                p_name = str(p.get("name") or "").strip().lower()
+                vals = p.get("values") or [p.get("value")]
+                val_first = str(vals[0]).strip() if vals and vals[0] else ""
+
+                if not val_first:
+                    continue
+
+                if p_id in ["12", "vorgangszeichen"] or p_key in ["vorgangszeichen"] or p_name in ["vorgangszeichen"]:
+                    result["vorgangszeichen"] = val_first
+                elif p_id in ["1", "titel", "title", "betreff"] or p_key in ["titel", "title", "betreff"] or p_name in [
+                    "titel", "title", "betreff"]:
+                    if not result["title"]:
+                        result["title"] = val_first
+                elif p_id in ["dateiname", "filename"] or p_key in ["dateiname", "filename"] or p_name in ["dateiname",
+                                                                                                           "filename"]:
+                    if not result["filename"]:
+                        result["filename"] = val_first
+                elif "vero" in p_id or "vero" in p_key or "vero" in p_name:
+                    if "id" in p_id or "id" in p_key or "id" in p_name:
+                        result["vero_id"] = val_first
 
             result["status_515"] = extract_status_515_from_props(props)
             result["kostenstelle"] = extract_kostenstelle_from_props(props)
@@ -152,7 +194,7 @@ def get_details_from_d3_object(d3_client: D3DMSClient, doc_id: str) -> dict:
 
 
 def search_antrag_files_in_d3(d3_client: D3DMSClient, aktenzeichen: str, akte_id: str) -> list:
-    """Ищет документы в целевых папках (/009 и /002) Акты."""
+    """Ищет все документы внутри Акты с полной структурой метаданных."""
     if not aktenzeichen or aktenzeichen == "UNBEKANNT":
         return []
 
@@ -174,33 +216,19 @@ def search_antrag_files_in_d3(d3_client: D3DMSClient, aktenzeichen: str, akte_id
                 if akte_id and doc_id == akte_id:
                     continue  # Пропускаем саму Акту
 
-                props = get_all_properties(item)
-                status_515 = extract_status_515_from_props(props)
-                kostenstelle = extract_kostenstelle_from_props(props)
+                doc_info = get_details_from_d3_object(d3_client, doc_id)
 
-                vorgangszeichen = ""
-                for p in props:
-                    p_id = str(p.get("id") or p.get("key") or p.get("name")).strip().lower()
-                    if p_id in ["12", "vorgangszeichen"]:
-                        vals = p.get("values") or [p.get("value")]
-                        if vals and vals[0]:
-                            vorgangszeichen = str(vals[0])
-
-                if not status_515 or not vorgangszeichen or not kostenstelle:
-                    doc_info = get_details_from_d3_object(d3_client, doc_id)
-                    if not status_515:
-                        status_515 = doc_info["status_515"]
-                    if not vorgangszeichen:
-                        vorgangszeichen = doc_info["vorgangszeichen"]
-                    if not kostenstelle:
-                        kostenstelle = doc_info["kostenstelle"]
-
-                if vorgangszeichen and (vorgangszeichen.endswith("/009") or vorgangszeichen.endswith("/002")):
+                if doc_info["vorgangszeichen"] and (
+                        doc_info["vorgangszeichen"].endswith("/009") or doc_info["vorgangszeichen"].endswith("/002")):
                     found_documents.append({
                         "doc_id": doc_id,
-                        "vorgangszeichen": vorgangszeichen,
-                        "vero_status_515": status_515 or "UNBEKANNT",
-                        "kostenstelle": kostenstelle or ""
+                        "vorgangszeichen": doc_info["vorgangszeichen"],
+                        "vero_status_515": doc_info["status_515"] or "UNBEKANNT",
+                        "kostenstelle": doc_info["kostenstelle"] or "",
+                        "title": doc_info["title"] or "",
+                        "filename": doc_info["filename"] or "",
+                        "vero_id": doc_info["vero_id"] or "",
+                        "raw_text_dump": doc_info["raw_text_dump"] or ""
                     })
 
     except Exception as e:

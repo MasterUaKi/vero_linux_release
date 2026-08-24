@@ -1,11 +1,11 @@
 # ==============================================================================
 # Script Name: dspace_pool_pdf_batch_processor_input.py
-# Version:     4.6.0
+# Version:     4.10.0
 # Date:        2026-08-24
 # Author:      Oleh Riabtsev / AI Assistant
 # Description: Continuous Daemon Mode with i18n and UUID extraction from authority.
-#              UPDATED: Added automated back-sync of 'Kostenstelle' from d.3 DMS
-#              to DSpace metadata 'veroFU.resources.TypevecContribution' on final approval.
+#              UPDATED: Added deep UUID multi-field matching with title fallback
+#              and detailed diagnostic logging of all evaluated d.3 documents.
 # ==============================================================================
 
 import json
@@ -35,7 +35,7 @@ from dspace_scan_pool_details import DSpacePoolScanner
 from dspace_to_d3_mapper import DSpaceToD3Mapper
 from generate_pdf_report import VeROPDFGenerator
 from d3_api_client import D3DMSClient
-from d3_dspace_status_checker import search_antrag_files_in_d3, get_details_from_d3_object
+from d3_dspace_status_checker import search_antrag_files_in_d3, is_valid_kostenstelle
 
 TARGET_DSPACE_KOSTENSTELLE_FIELD = "veroFU.resources.TypevecContribution"
 
@@ -99,6 +99,62 @@ def is_final_approved(status_string: str) -> bool:
     """Check if the status is a final approval (either Praesidium or Kostenstelle)."""
     status_clean = str(status_string).strip().lower()
     return "praesidium_ja" in status_clean or "kostenstelle_vergeben" in status_clean
+
+
+def find_specific_task_document(docs: list, target_folder_code: str, item_uuid: str, task_title: str = "") -> dict:
+    """
+    Интеллектуальный поиск документа задачи в d.3:
+    1. Ищет вхождение UUID в имени файла, заголовке, vero_id или полном JSON дампа свойств.
+    2. Если точный UUID не найден, сопоставляет по названию задачи DSpace.
+    3. Выводит подробный диагностический лог всех проверенных документов.
+    """
+    if not docs:
+        return {}
+
+    folder_docs = [d for d in docs if d.get("vorgangszeichen", "").endswith(f"/{target_folder_code}")]
+    if not folder_docs:
+        return {}
+
+    uuid_clean = item_uuid.strip().lower() if item_uuid else ""
+    title_clean = task_title.strip().lower() if task_title else ""
+
+    logging.info(f"🔍 Сканирование папки {target_folder_code} (Найдено документов: {len(folder_docs)}) для UUID=[{item_uuid}]:")
+
+    # 1. Приоритет: Полное совпадение по UUID в метаданных или дампах
+    for doc in folder_docs:
+        doc_id = doc.get("doc_id", "")
+        doc_title = str(doc.get("title", "")).strip()
+        doc_filename = str(doc.get("filename", "")).strip()
+        doc_vero_id = str(doc.get("vero_id", "")).strip()
+        raw_dump = doc.get("raw_text_dump", "")
+
+        logging.info(f"   • Doc ID={doc_id} | Titel='{doc_title}' | Datei='{doc_filename}' | Status={doc.get('vero_status_515')}")
+
+        if uuid_clean and (
+            uuid_clean in doc_vero_id.lower() or
+            uuid_clean in doc_filename.lower() or
+            uuid_clean in doc_title.lower() or
+            uuid_clean in raw_dump
+        ):
+            logging.info(f"🎯 [MATCH BY UUID] Документ ID={doc_id} однозначно идентифицирован по UUID {item_uuid}")
+            return doc
+
+    # 2. Фолбэк: Сопоставление по названию задачи
+    if title_clean:
+        for doc in folder_docs:
+            doc_id = doc.get("doc_id", "")
+            doc_title = str(doc.get("title", "")).strip().lower()
+            if title_clean in doc_title or doc_title in title_clean:
+                logging.info(f"🎯 [MATCH BY TITLE] Документ ID={doc_id} сопоставлен по названию '{task_title}'")
+                return doc
+
+    # 3. Если совпадений нет, но в папке всего 1 документ — используем его
+    if len(folder_docs) == 1:
+        single_doc = folder_docs[0]
+        logging.info(f"🎯 [SINGLE DOC] В папке {target_folder_code} найден единственный документ ID={single_doc.get('doc_id')}")
+        return single_doc
+
+    return {}
 
 
 def process_live_workflow():
@@ -170,15 +226,13 @@ def process_live_workflow():
 
                 if app_aktenzeichen != "UNBEKANNT":
                     app_files = search_antrag_files_in_d3(d3_client, app_aktenzeichen, app_akte_id)
-                    if app_files:
-                        # УМНЫЙ ПОИСК СТАТУСА (Фаза 1) - добавили kostenstelle_vergeben
-                        statuses = [f.get("vero_status_515", "UNBEKANNT") for f in app_files]
-                        active = [s for s in statuses if s and s != "UNBEKANNT"]
-                        if active:
-                            decision = next((s for s in active if
-                                             "praesidium_ja" in s.lower() or "praesidium_nein" in s.lower() or "kostenstelle_vergeben" in s.lower()),
-                                            None)
-                            app_status_in_d3 = decision if decision else active[0]
+                    parent_app_doc = find_specific_task_document(
+                        docs=app_files,
+                        target_folder_code=D3_FOLDER_APPLICATION,
+                        item_uuid=linked_app_uuid
+                    )
+                    if parent_app_doc:
+                        app_status_in_d3 = parent_app_doc.get("vero_status_515", "UNBEKANNT")
 
                 logging.info(t("PARENT_STATUS", status=app_status_in_d3))
 
@@ -207,7 +261,6 @@ def process_live_workflow():
                 title=project_title
             )
 
-            # ФЛАГ УСПЕШНОЙ ЗАГРУЗКИ
             upload_success = False
 
             if pdf_created and d3_authenticated and location_url:
@@ -215,22 +268,17 @@ def process_live_workflow():
                 aktenzeichen = d3_client.get_aktenzeichen(location_url)
                 if aktenzeichen != "UNBEKANNT":
                     vorgangszeichen = f"{aktenzeichen}/{folder_code}"
-                    if d3_client.check_document_exists(vorgangszeichen, akte_id=akte_id):
-                        logging.info(t("DOC_EXISTS", folder_name=folder_name, vorgangszeichen=vorgangszeichen))
+                    logging.info(t("UPLOADING_PDF", entity_type=entity_type, aktenzeichen=aktenzeichen,
+                                   folder_name=folder_name, folder_code=folder_code))
+                    doc_location = d3_client.upload_pdf_document(
+                        pdf_filepath=pdf_filepath,
+                        aktenzeichen=aktenzeichen,
+                        project_title=f"{project_title} [{vero_id}]",
+                        folder_code=folder_code
+                    )
+                    if doc_location:
                         upload_success = True
-                    else:
-                        logging.info(t("UPLOADING_PDF", entity_type=entity_type, aktenzeichen=aktenzeichen,
-                                       folder_name=folder_name, folder_code=folder_code))
-                        doc_location = d3_client.upload_pdf_document(
-                            pdf_filepath=pdf_filepath,
-                            aktenzeichen=aktenzeichen,
-                            project_title=project_title,
-                            folder_code=folder_code
-                        )
-                        if doc_location:
-                            upload_success = True
 
-            # ПРИНЯТИЕ ЗАДАЧИ БОТОМ
             if upload_success:
                 scanner.claim_pool_task(pooltask_id)
             else:
@@ -283,61 +331,49 @@ def process_live_workflow():
                 aktenzeichen = d3_client.get_aktenzeichen(location_url)
                 if aktenzeichen != "UNBEKANNT":
                     files = search_antrag_files_in_d3(d3_client, aktenzeichen, akte_id)
-
                     target_folder_code = D3_FOLDER_FUNDING if is_funding else D3_FOLDER_APPLICATION
-                    matching_files = [
-                        f for f in files
-                        if f.get("vorgangszeichen", "").endswith(f"/{target_folder_code}")
-                    ]
 
-                    # 🔥 УМНЫЙ ПОИСК СТАТУСА - поиск статуса и значения Kostenstelle
-                    if matching_files:
-                        all_statuses = [f.get("vero_status_515", "UNBEKANNT") for f in matching_files]
-                        active_statuses = [s for s in all_statuses if s and s != "UNBEKANNT"]
+                    # Интеллектуальный поиск документа задачи
+                    target_doc = find_specific_task_document(
+                        docs=files,
+                        target_folder_code=target_folder_code,
+                        item_uuid=vero_id,
+                        task_title=project_title
+                    )
 
-                        if active_statuses:
-                            decision = next((s for s in active_statuses if
-                                             "praesidium_ja" in s.lower() or "praesidium_nein" in s.lower() or "kostenstelle_vergeben" in s.lower()),
-                                            None)
-                            if decision:
-                                doc_status_in_d3 = decision
-                            else:
-                                doc_status_in_d3 = active_statuses[0]
-
-                        # Извлечение Kostenstelle из найденных файлов
-                        for f in matching_files:
-                            if f.get("kostenstelle"):
-                                kostenstelle_val = f["kostenstelle"]
-                                break
-
-                    # Если в свойствах документа Kostenstelle не найдена, проверяем свойства самой Акты
-                    if not kostenstelle_val:
-                        akte_details = get_details_from_d3_object(d3_client, akte_id)
-                        kostenstelle_val = akte_details.get("kostenstelle", "")
+                    if target_doc:
+                        doc_status_in_d3 = target_doc.get("vero_status_515", "UNBEKANNT")
+                        kostenstelle_val = target_doc.get("kostenstelle", "")
+                        logging.info(f"📄 Zugeordnetes d.3-Dokument: ID={target_doc.get('doc_id')} (Titel: '{target_doc.get('title')}')")
+                    else:
+                        logging.warning(f"⚠️ d.3-Dokument für {entity_type} (Vero_ID={vero_id}) im Ordner {target_folder_code} noch nicht gefunden.")
 
             status_clean = doc_status_in_d3.strip().lower()
             logging.info(t("DOC_STATUS_IN_D3", entity_type=entity_type,
                            folder_code=(D3_FOLDER_FUNDING if is_funding else D3_FOLDER_APPLICATION),
                            status=doc_status_in_d3))
 
+            # ------------------------------------------------------------------
             # Обработка успешных финальных статусов
+            # ------------------------------------------------------------------
             if "praesidium_ja" in status_clean or "kostenstelle_vergeben" in status_clean:
                 if "kommentar" in status_clean or "auflagen" in status_clean:
                     logging.info(t("APPROVED_WITH_COMMENT", entity_type=entity_type))
                 else:
                     logging.info(t("APPROVED_SIMPLE", entity_type=entity_type))
 
-                # Обратная синхронизация Kostenstelle в DSpace VeRO
-                if kostenstelle_val:
-                    logging.info(f"🔢 Gefundene Kostenstelle in d.3: [{kostenstelle_val}]")
-                    item_target_uuid = item_info.get("uuid") or vero_id
-                    scanner.update_item_metadata_field(
-                        item_uuid=item_target_uuid,
-                        field_name=TARGET_DSPACE_KOSTENSTELLE_FIELD,
-                        value=kostenstelle_val
-                    )
-                else:
-                    logging.warning(f"⚠️ Статус '{doc_status_in_d3}', но значение Kostenstelle в d.3 не найдено.")
+                # Обратная синхронизация Kostenstelle (только для Funding и только при валидном значении)
+                if is_funding:
+                    if kostenstelle_val and is_valid_kostenstelle(kostenstelle_val):
+                        logging.info(f"🔢 Gefundene Kostenstelle in d.3: [{kostenstelle_val}]")
+                        item_target_uuid = item_info.get("uuid") or vero_id
+                        scanner.update_item_metadata_field(
+                            item_uuid=item_target_uuid,
+                            field_name=TARGET_DSPACE_KOSTENSTELLE_FIELD,
+                            value=kostenstelle_val
+                        )
+                    else:
+                        logging.warning(f"⚠️ Funding genehmigt, aber noch keine gültige Kostenstelle in d.3 gefunden.")
 
                 scanner.approve_claimed_task(claimedtask_id)
 
