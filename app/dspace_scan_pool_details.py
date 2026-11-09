@@ -1,12 +1,13 @@
 # ==============================================================================
 # Script Name: dspace_scan_pool_details.py
-# Version:     1.8.0
-# Date:        2026-08-24
+# Version:     1.9.0
+# Date:        2026-10-27
 # Author:      Oleh Riabtsev / AI Assistant
 # Description: Scanner for both unclaimed (pooltasks) and claimed (claimedtasks)
-#              workflow items in DSpace 7 REST API.
-#              UPDATED: Added update_item_metadata_field() using JSON PATCH to
-#              sync metadata (e.g. Kostenstelle) back to DSpace Items.
+#              workflow items in DSpace 7/8 REST API.
+#              UPDATED: Enhanced update_item_metadata_field() to natively support
+#              both single string values and list/iterable of strings using
+#              RFC 6902 JSON-PATCH with graceful replace-to-add fallback.
 # ==============================================================================
 
 import json
@@ -344,43 +345,73 @@ class DSpacePoolScanner:
             logging.error(f"[-] Exception rejecting ClaimedTask ID={claimedtask_id}: {str(e)}")
             return False
 
-    def update_item_metadata_field(self, item_uuid: str, field_name: str, value: str) -> bool:
-        """8. Обновление метаполя объекта (Item) в DSpace через JSON PATCH."""
-        if not item_uuid or not field_name or not value:
+    def update_item_metadata_field(self, item_uuid: str, field_name: str, value) -> bool:
+        """
+        8. Обновление метаполя объекта (Item) в DSpace через JSON PATCH.
+        Принимает одиночное значение (str) либо список значений (list[str]) для повторяющихся полей.
+        """
+        if not item_uuid or not field_name or value is None:
+            return False
+
+        if isinstance(value, (list, tuple, set)):
+            values_list = [str(v).strip() for v in value if str(v).strip()]
+        else:
+            val_str = str(value).strip()
+            values_list = [val_str] if val_str else []
+
+        if not values_list:
             return False
 
         url = f"{self.base_url}/core/items/{item_uuid}"
         xsrf_cookie = self.session.cookies.get("DSPACE-XSRF-COOKIE")
 
         headers = {
-            "Content-Type": "application/json"
+            "Content-Type": "application/json-patch+json"
         }
         if xsrf_cookie:
             headers["X-XSRF-TOKEN"] = xsrf_cookie
 
-        patch_payload = [
+        payload_values = [
             {
-                "op": "add",
+                "value": v,
+                "language": None,
+                "authority": None,
+                "confidence": -1
+            }
+            for v in values_list
+        ]
+
+        patch_replace = [
+            {
+                "op": "replace",
                 "path": f"/metadata/{field_name}",
-                "value": [
-                    {
-                        "value": str(value).strip(),
-                        "language": None,
-                        "authority": None,
-                        "confidence": -1
-                    }
-                ]
+                "value": payload_values
             }
         ]
 
         try:
             time.sleep(DSPACE_REQUEST_DELAY)
-            resp = self.session.patch(url, json=patch_payload, headers=headers)
-            if resp.status_code == 200:
-                logging.info(f"✅ Метаданные DSpace успешно обновлены: [{field_name} = '{value}'] (UUID: {item_uuid})")
+            resp = self.session.patch(url, json=patch_replace, headers=headers)
+            if resp.status_code in [200, 204]:
+                logging.info(f"✅ Метаданные DSpace успешно обновлены: [{field_name} = {values_list}] (UUID: {item_uuid})")
                 return True
+            elif resp.status_code in [404, 422]:
+                patch_add = [
+                    {
+                        "op": "add",
+                        "path": f"/metadata/{field_name}",
+                        "value": payload_values
+                    }
+                ]
+                resp_add = self.session.patch(url, json=patch_add, headers=headers)
+                if resp_add.status_code in [200, 204]:
+                    logging.info(f"✅ Метаданные DSpace успешно добавлены: [{field_name} = {values_list}] (UUID: {item_uuid})")
+                    return True
+                else:
+                    logging.error(f"[-] Ошибка PATCH (add) DSpace ({resp_add.status_code}): {resp_add.text}")
+                    return False
             else:
-                logging.error(f"[-] Ошибка PATCH DSpace ({resp.status_code}): {resp.text}")
+                logging.error(f"[-] Ошибка PATCH (replace) DSpace ({resp.status_code}): {resp.text}")
                 return False
         except Exception as e:
             logging.error(f"[-] Исключение при обновлении метаданных DSpace: {e}")

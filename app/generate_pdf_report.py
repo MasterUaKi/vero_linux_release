@@ -1,10 +1,13 @@
 # ==============================================================================
 # Script Name: dspace_pdf_generator.py
-# Version:     1.1.0
-# Date:        2026-07-23
+# Version:     1.3.0
+# Date:        2026-09-07
 # Author:      Oleh Riabtsev / AI Assistant
 # Description: PDF Meldebogen / Stammblatt Generator conforming strictly to
 #              University of Vechta Corporate Design Manual (v2023) and d.3 DMS rules.
+#              UPDATED: Set footer for Application to 'Referat Forschung,
+#              Nachwuchsförderung und Transfer' (RFNT) and Funding to
+#              'Drittmittelverwaltung' according to Christine Gröneweg's specifications.
 # ==============================================================================
 
 import html
@@ -22,7 +25,7 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(message)s'
 )
 
-# === ОФІЦІЙНА ПАЛІТРА UNIVERITÄT VECHTA (HAUSFARBEN) ===
+# === ОФІЦІЙНА ПАЛІТРА UNIVERSITÄT VECHTA (HAUSFARBEN) ===
 COLOR_UNI_RED = colors.HexColor("#C10B25")         # CMYK 0/100/80/20 - Основний червоний акцент
 COLOR_UNI_BLACK = colors.HexColor("#000000")       # CMYK 0/0/0/100 - Основний текст
 COLOR_UNI_GRAY = colors.HexColor("#888888")        # CMYK 0/0/0/60 - Допоміжний сірий
@@ -34,6 +37,8 @@ class NumberedCanvas(canvas.Canvas):
     Кастомний Canvas для двопрохідної нумерації сторінок ('Seite X von Y')
     та оформлення верхніх/нижніх колонтитулів за гайдлайнами Uni Vechta.
     """
+
+    custom_footer_left = "VeRO — Referat Forschung, Nachwuchsförderung und Transfer / Antragsanmeldung"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -75,7 +80,11 @@ class NumberedCanvas(canvas.Canvas):
         self.setLineWidth(1.0)
         self.line(margin, 1.3 * cm, page_width - margin, 1.3 * cm)
 
-        footer_left = "VeRO — Drittmittelverwaltung / Projektanzeige (Meldebogen)"
+        footer_left = getattr(
+            self,
+            "custom_footer_left",
+            "VeRO — Referat Forschung, Nachwuchsförderung und Transfer / Antragsanmeldung"
+        )
         footer_right = f"Seite {self._pageNumber} von {page_count}"
 
         self.drawString(margin, 0.8 * cm, footer_left)
@@ -96,11 +105,38 @@ class VeROPDFGenerator:
         return escaped.replace("\n", "<br/>")
 
     @classmethod
-    def generate_pdf(cls, pdf_groups_data: list, output_filepath: str, vero_id: str = "UNBEKANNT", title: str = "") -> bool:
+    def generate_pdf(
+        cls,
+        pdf_groups_data: list,
+        output_filepath: str,
+        vero_id: str = "UNBEKANNT",
+        title: str = "",
+        is_funding: bool = None
+    ) -> bool:
         """
-        Генерує офіційний PDF-файл Meldebogen за структурою 6 груп з DSpaceToD3Mapper.
+        Генерує офіційний PDF-файл Meldebogen за структурою груп з DSpaceToD3Mapper.
+        Автоматично встановлює заголовки та підписи підрозділів:
+        - Application: 'Antragsanmeldung' та 'Referat Forschung, Nachwuchsförderung und Transfer'
+        - Funding: 'Projektanzeige / Meldebogen' та 'Drittmittelverwaltung'
         """
         try:
+            # Автоматичне визначення типу, якщо параметр is_funding не передано явно
+            if is_funding is None:
+                first_group_name = pdf_groups_data[0].get("group_name", "") if pdf_groups_data else ""
+                is_funding = ("förderanzeige" in first_group_name.lower()) or ("funding" in first_group_name.lower())
+
+            # Динамічні заголовки для шапки та нижнього колонтитула
+            if is_funding:
+                doc_heading = "Projektanzeige / Meldebogen"
+                footer_text = "VeRO — Drittmittelverwaltung / Projektanzeige (Meldebogen)"
+            else:
+                doc_heading = "Antragsanmeldung"
+                footer_text = "VeRO — Referat Forschung, Nachwuchsförderung und Transfer / Antragsanmeldung"
+
+            # Створення динамічного класу Canvas з відповідним колонтитулом
+            class DynamicNumberedCanvas(NumberedCanvas):
+                custom_footer_left = footer_text
+
             doc = SimpleDocTemplate(
                 output_filepath,
                 pagesize=A4,
@@ -175,14 +211,19 @@ class VeROPDFGenerator:
             story = []
 
             # --- 1. ШАПКА ДОКУМЕНТА ---
-            story.append(Paragraph("Projektanzeige / Meldebogen", doc_title_style))
+            story.append(Paragraph(doc_heading, doc_title_style))
 
-            # Формуємо Betreff за рекомендацією Андреаса: "[Projektbezeichnung]/Meldebogen"
-            betreff_text = f"Betreff: {title}/Meldebogen" if title else f"Betreff: Meldebogen ({vero_id})"
+            # Формування Betreff
+            suffix = "Meldebogen" if is_funding else "Antragsanmeldung"
+            betreff_text = f"Betreff: {title}/{suffix}" if title else f"Betreff: {suffix} ({vero_id})"
             story.append(Paragraph(html.escape(betreff_text), betreff_style))
 
             creation_date = datetime.now().strftime("%d.%m.%Y %H:%M")
-            meta_text = f"<b>Vero_ID:</b> {vero_id} &nbsp;&nbsp;|&nbsp;&nbsp; <b>Dokumenttyp:</b> Meldebogen &nbsp;&nbsp;|&nbsp;&nbsp; <b>Datum:</b> {creation_date}"
+            meta_text = (
+                f"<b>Vero_ID:</b> {vero_id} &nbsp;&nbsp;|&nbsp;&nbsp; "
+                f"<b>Dokumenttyp:</b> {suffix} &nbsp;&nbsp;|&nbsp;&nbsp; "
+                f"<b>Datum:</b> {creation_date}"
+            )
             story.append(Paragraph(meta_text, meta_style))
 
             # Червоний розділювач
@@ -194,7 +235,7 @@ class VeROPDFGenerator:
                 spaceAfter=6
             ))
 
-            # --- 2. РЕНДЕРИНГ 6 ГРУП ТАБЛИЦІ ---
+            # --- 2. РЕНДЕРИНГ ГРУП ТАБЛИЦІ ---
             col_widths = [6.2 * cm, 11.8 * cm]  # Разом 18.0 см (Ширина A4 мінус відступи)
 
             for group in pdf_groups_data:
@@ -236,9 +277,9 @@ class VeROPDFGenerator:
                 story.append(table)
                 story.append(Spacer(1, 4))
 
-            # Побудова PDF з двопрохідним кастомним канвасом
-            doc.build(story, canvasmaker=NumberedCanvas)
-            logging.info(f" PDF Meldebogen успішно згенеровано: {output_filepath}")
+            # Побудова PDF з динамічним канвасом
+            doc.build(story, canvasmaker=DynamicNumberedCanvas)
+            logging.info(f"PDF {suffix} успішно згенеровано: {output_filepath}")
             return True
 
         except Exception as e:

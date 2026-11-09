@@ -1,18 +1,30 @@
 # ==============================================================================
 # Script Name: dspace_pool_pdf_batch_processor_input.py
-# Version:     4.10.0
-# Date:        2026-08-24
+# Version:     4.22.0
+# Date:        2026-11-02
 # Author:      Oleh Riabtsev / AI Assistant
-# Description: Continuous Daemon Mode with i18n and UUID extraction from authority.
-#              UPDATED: Added deep UUID multi-field matching with title fallback
-#              and detailed diagnostic logging of all evaluated d.3 documents.
+# Description: Continuous Daemon Mode with dual-level status resolution:
+#              - Preserves all legacy logic, workflows, mappings, and fallbacks.
+#              - Integrated item_uuid forwarding into search_antrag_files_in_d3
+#                across Phase 1 and Phase 2, ensuring Meldebogen PDF (T000054276)
+#                is reliably retrieved and matched by UUID.
+#              - Prioritizes specific document status in folder /009 (Praesidium_Ja)
+#                for Application with graceful Akte-level fallback.
+#              - Funding status (Kostenstelle_vergeben, Fonds, Finanzstelle) is
+#                resolved from the specific document inside folder /002.
+#              - Parallel extraction and recording of both 'Fonds' and 'Finanzstelle'
+#                into repeatable DSpace-CRIS CERIF field 'oairecerif.internalid'.
+#              - Automatic JSON-Patch append (/metadata/<field>/-) ensuring
+#                persistence of place 0 and place 1 in PostgreSQL.
 # ==============================================================================
 
 import json
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import os
+import re
 import time
+import requests
 
 from config_loader import (
     DSPACE_BASE_URL,
@@ -35,9 +47,15 @@ from dspace_scan_pool_details import DSpacePoolScanner
 from dspace_to_d3_mapper import DSpaceToD3Mapper
 from generate_pdf_report import VeROPDFGenerator
 from d3_api_client import D3DMSClient
-from d3_dspace_status_checker import search_antrag_files_in_d3, is_valid_kostenstelle
+from d3_dspace_status_checker import (
+    search_antrag_files_in_d3,
+    is_valid_kostenstelle,
+    is_explicit_rejection_value,
+    get_details_from_d3_object
+)
 
-TARGET_DSPACE_KOSTENSTELLE_FIELD = "veroFU.resources.TypevecContribution"
+# Официальное повторяющееся поле CERIF / DSpace-CRIS для Fonds и Finanzstelle SAP
+TARGET_DSPACE_INTERNALID_FIELD = "oairecerif.internalid"
 
 
 def setup_logging():
@@ -68,7 +86,181 @@ def setup_logging():
     root_logger.addHandler(console_handler)
 
 
+def build_dspace_url(base_url: str, endpoint: str) -> str:
+    """Формирует корректный URL эндпоинта DSpace REST API без дублирования /server/api."""
+    b = str(base_url).rstrip("/")
+    ep = str(endpoint).strip("/")
+
+    if "/server/api" in b:
+        root = b[:b.find("/server/api") + len("/server/api")]
+        if ep.startswith("server/api/"):
+            ep = ep[len("server/api/"):]
+        elif ep == "server/api":
+            ep = ""
+        return f"{root}/{ep}" if ep else root
+    elif "/server" in b:
+        root = b[:b.find("/server") + len("/server")]
+        if ep.startswith("server/"):
+            ep = ep[len("server/"):]
+        if not ep.startswith("api/"):
+            ep = f"api/{ep}"
+        return f"{root}/{ep}"
+    else:
+        if not ep.startswith("server/api/"):
+            ep = f"server/api/{ep}"
+        return f"{b}/{ep}"
+
+
+def get_akte_status_in_d3(d3_client: D3DMSClient, location_url: str) -> str:
+    """
+    Извлекает статус согласования (поле 515) непосредственно с уровня Акты (Drittmittelakte).
+    Используется как запасной вариант для сущности Application, если статус на документе не найден.
+    """
+    if not location_url:
+        return "UNBEKANNT"
+
+    akte_id = location_url.split("/")[-1].split("?")[0]
+
+    # Шаг 1: Попытка через штатный модуль парсинга свойств объекта d.3
+    try:
+        details = get_details_from_d3_object(d3_client, akte_id)
+        if details and isinstance(details, dict):
+            st = details.get("status_515", "")
+            if st and st != "UNBEKANNT":
+                return st
+            raw_dump = details.get("raw_text_dump", "").lower()
+            if "praesidium_ja" in raw_dump:
+                return "Praesidium_Ja"
+            elif "praesidium_nein" in raw_dump:
+                return "Praesidium_Nein"
+            elif "pdf_zu_allris_hochgeladen" in raw_dump:
+                return "PDF_zu_ALLRIS_hochgeladen"
+    except Exception as e:
+        logging.debug(f"get_details_from_d3_object для Акты {akte_id} вернул ошибку: {e}")
+
+    # Шаг 2: Прямой HTTP-запрос с нормализацией URL (добавление схемы D3_URL)
+    base = str(D3_URL).rstrip("/")
+    loc_str = str(location_url).strip()
+    full_url = loc_str if loc_str.startswith(("http://", "https://")) else f"{base}/{loc_str.lstrip('/')}"
+
+    headers = {}
+    if hasattr(d3_client, "headers") and isinstance(d3_client.headers, dict):
+        headers.update(d3_client.headers)
+    elif hasattr(d3_client, "_headers") and isinstance(d3_client._headers, dict):
+        headers.update(d3_client._headers)
+
+    api_key = getattr(d3_client, "api_key", None) or D3_API_KEY
+    if api_key:
+        if "Authorization" not in headers:
+            headers["Authorization"] = f"Bearer {api_key}"
+        if "X-Api-Key" not in headers:
+            headers["X-Api-Key"] = str(api_key)
+    if "Accept" not in headers:
+        headers["Accept"] = "application/json"
+
+    try:
+        sess = (
+            getattr(d3_client, "_session", None)
+            or getattr(d3_client, "session", None)
+            or getattr(d3_client, "s", None)
+            or getattr(d3_client, "http", None)
+        )
+
+        if sess and hasattr(sess, "get"):
+            resp = sess.get(full_url, headers=headers, timeout=10)
+        else:
+            resp = requests.get(full_url, headers=headers, timeout=10)
+
+        if resp.status_code == 200:
+            data = resp.json()
+            properties = data.get("properties", []) or data.get("objectProperties", [])
+            for p in properties:
+                k = str(p.get("key", "") or p.get("id", "")).strip().lower()
+                if k == "515" or k.endswith(".515") or "status" in k:
+                    vals = p.get("values", []) or [p.get("value")]
+                    if vals and vals[0]:
+                        val_str = str(vals[0]).strip()
+                        if val_str:
+                            return val_str
+
+            raw_dump = json.dumps(data, ensure_ascii=False).lower()
+            if "praesidium_ja" in raw_dump:
+                return "Praesidium_Ja"
+            elif "praesidium_nein" in raw_dump:
+                return "Praesidium_Nein"
+            elif "pdf_zu_allris_hochgeladen" in raw_dump:
+                return "PDF_zu_ALLRIS_hochgeladen"
+
+    except Exception as e:
+        logging.warning(f"⚠️ Ошибка при запросе статуса Акты ({full_url}): {e}")
+
+    return "UNBEKANNT"
+
+
+def update_dspace_internal_ids(scanner: DSpacePoolScanner, item_uuid: str, id_values: list) -> bool:
+    """
+    Записывает параллельные значения (Fonds и Finanzstelle) в повторяющееся поле
+    oairecerif.internalid через RFC 6902 JSON-Patch (remove + append /-).
+    """
+    if not id_values:
+        return False
+
+    url = build_dspace_url(scanner.base_url, f"core/items/{item_uuid}")
+    headers = {
+        "Content-Type": "application/json-patch+json"
+    }
+
+    xsrf_token = scanner.session.cookies.get("DSPACE-XSRF-COOKIE")
+    if xsrf_token:
+        headers["X-XSRF-TOKEN"] = xsrf_token
+
+    # 1. Очистка старых записей
+    try:
+        patch_remove = [
+            {
+                "op": "remove",
+                "path": f"/metadata/{TARGET_DSPACE_INTERNALID_FIELD}"
+            }
+        ]
+        scanner.session.patch(url, json=patch_remove, headers=headers, timeout=10)
+    except Exception:
+        pass
+
+    # 2. Добавление каждого значения отдельной операцией через путь /- (append)
+    patch_add_ops = [
+        {
+            "op": "add",
+            "path": f"/metadata/{TARGET_DSPACE_INTERNALID_FIELD}/-",
+            "value": {
+                "value": str(val).strip(),
+                "language": None,
+                "authority": None,
+                "confidence": -1
+            }
+        }
+        for val in id_values
+        if str(val).strip()
+    ]
+
+    try:
+        resp = scanner.session.patch(url, json=patch_add_ops, headers=headers, timeout=10)
+        if resp.status_code in [200, 204]:
+            logging.info(f"✅ Успешно записаны значения {id_values} в {TARGET_DSPACE_INTERNALID_FIELD} (UUID: {item_uuid})")
+            return True
+        else:
+            logging.error(f"[-] Ошибка PATCH add DSpace ({resp.status_code}): {resp.text}")
+    except Exception as e:
+        logging.error(f"[-] Исключение при обновлении internalid: {e}")
+
+    return False
+
+
 def get_linked_application_uuid(wf_details: dict) -> str:
+    """Извлекает UUID родительской заявки (Application)."""
+    extracted = DSpaceToD3Mapper.extract_parent_application_uuid(wf_details)
+    if extracted and len(extracted) >= 36:
+        return extracted
+
     metadata_raw = wf_details.get("metadata_raw", {})
     fields_to_check = ["veroFU.application", "dc.relation.project", "oairecerif.fundingParent"]
 
@@ -85,29 +277,57 @@ def get_linked_application_uuid(wf_details: dict) -> str:
                     return str(val)
 
     metadata = wf_details.get("metadata", {})
-    app_uuid_list = metadata.get("veroFU.application") or metadata.get("dc.relation.project") or metadata.get(
-        "oairecerif.fundingParent") or []
+    app_uuid_list = (
+        metadata.get("veroFU.application")
+        or metadata.get("dc.relation.project")
+        or metadata.get("oairecerif.fundingParent")
+        or []
+    )
     if app_uuid_list:
         val = app_uuid_list[0]
-        if val and len(str(val)) >= 36 and "-" in str(val):
+        if isinstance(val, dict):
+            if val.get("authority") and len(str(val.get("authority"))) >= 36:
+                return str(val.get("authority")).strip()
+            if val.get("value") and len(str(val.get("value"))) >= 36:
+                return str(val.get("value")).strip()
+        elif val and len(str(val)) >= 36 and "-" in str(val):
             return str(val)
 
     return ""
 
 
-def is_final_approved(status_string: str) -> bool:
-    """Check if the status is a final approval (either Praesidium or Kostenstelle)."""
-    status_clean = str(status_string).strip().lower()
-    return "praesidium_ja" in status_clean or "kostenstelle_vergeben" in status_clean
+def is_rejection_status(status_string: str) -> bool:
+    """Проверяет, содержит ли статус маркеры отклонения (включая VPPF_abgelehnt)."""
+    s = str(status_string).strip().lower()
+    rejection_keywords = [
+        "vppf_abgelehnt",
+        "praesidium_nein",
+        "abgelehnt",
+        "verworfen",
+        "abbruch",
+        "kostenstelle_abgelehnt",
+        "nein",
+        "rejected"
+    ]
+    return any(k in s for k in rejection_keywords)
+
+
+def is_approval_status(status_string: str) -> bool:
+    """Проверяет, содержит ли статус маркеры положительного решения."""
+    s = str(status_string).strip().lower()
+    if is_rejection_status(s):
+        return False
+    return "praesidium_ja" in s or "kostenstelle_vergeben" in s
+
+
+def _extract_doc_number(doc: dict) -> int:
+    """Извлекает числовую часть ID документа d.3 для сортировки по хронологии."""
+    doc_id = str(doc.get("doc_id", ""))
+    digits = re.sub(r"\D", "", doc_id)
+    return int(digits) if digits else 0
 
 
 def find_specific_task_document(docs: list, target_folder_code: str, item_uuid: str, task_title: str = "") -> dict:
-    """
-    Интеллектуальный поиск документа задачи в d.3:
-    1. Ищет вхождение UUID в имени файла, заголовке, vero_id или полном JSON дампа свойств.
-    2. Если точный UUID не найден, сопоставляет по названию задачи DSpace.
-    3. Выводит подробный диагностический лог всех проверенных документов.
-    """
     if not docs:
         return {}
 
@@ -120,7 +340,6 @@ def find_specific_task_document(docs: list, target_folder_code: str, item_uuid: 
 
     logging.info(f"🔍 Сканирование папки {target_folder_code} (Найдено документов: {len(folder_docs)}) для UUID=[{item_uuid}]:")
 
-    # 1. Приоритет: Полное совпадение по UUID в метаданных или дампах
     for doc in folder_docs:
         doc_id = doc.get("doc_id", "")
         doc_title = str(doc.get("title", "")).strip()
@@ -128,7 +347,10 @@ def find_specific_task_document(docs: list, target_folder_code: str, item_uuid: 
         doc_vero_id = str(doc.get("vero_id", "")).strip()
         raw_dump = doc.get("raw_text_dump", "")
 
-        logging.info(f"   • Doc ID={doc_id} | Titel='{doc_title}' | Datei='{doc_filename}' | Status={doc.get('vero_status_515')}")
+        logging.info(
+            f"   • Doc ID={doc_id} | Titel='{doc_title}' | Fonds='{doc.get('fonds')}' | "
+            f"Finanzstelle='{doc.get('finanzstelle')}' | Status={doc.get('vero_status_515')}"
+        )
 
         if uuid_clean and (
             uuid_clean in doc_vero_id.lower() or
@@ -139,7 +361,6 @@ def find_specific_task_document(docs: list, target_folder_code: str, item_uuid: 
             logging.info(f"🎯 [MATCH BY UUID] Документ ID={doc_id} однозначно идентифицирован по UUID {item_uuid}")
             return doc
 
-    # 2. Фолбэк: Сопоставление по названию задачи
     if title_clean:
         for doc in folder_docs:
             doc_id = doc.get("doc_id", "")
@@ -148,13 +369,41 @@ def find_specific_task_document(docs: list, target_folder_code: str, item_uuid: 
                 logging.info(f"🎯 [MATCH BY TITLE] Документ ID={doc_id} сопоставлен по названию '{task_title}'")
                 return doc
 
-    # 3. Если совпадений нет, но в папке всего 1 документ — используем его
     if len(folder_docs) == 1:
         single_doc = folder_docs[0]
         logging.info(f"🎯 [SINGLE DOC] В папке {target_folder_code} найден единственный документ ID={single_doc.get('doc_id')}")
         return single_doc
 
-    return {}
+    folder_docs_sorted = sorted(folder_docs, key=_extract_doc_number, reverse=True)
+
+    newest_doc = folder_docs_sorted[0]
+    newest_status = newest_doc.get("vero_status_515", "")
+    if newest_status and newest_status != "UNBEKANNT":
+        logging.info(
+            f"🎯 [MATCH BY LATEST] В папке {target_folder_code} выбран новейший документ ID={newest_doc.get('doc_id')} (Status={newest_status})"
+        )
+        return newest_doc
+
+    for doc in folder_docs_sorted:
+        st = doc.get("vero_status_515", "")
+        if is_approval_status(st):
+            logging.info(
+                f"🎯 [MATCH BY APPROVAL] В папке {target_folder_code} найден одобренный документ ID={doc.get('doc_id')} (Status={st})"
+            )
+            return doc
+
+    for doc in folder_docs_sorted:
+        st = doc.get("vero_status_515", "")
+        if st and st != "UNBEKANNT":
+            logging.info(
+                f"🎯 [MATCH BY KNOWN STATUS] В папке {target_folder_code} выбран документ ID={doc.get('doc_id')} со статусом '{st}'"
+            )
+            return doc
+
+    logging.info(
+        f"🎯 [MATCH BY FALLBACK] В папке {target_folder_code} выбран новейший документ ID={newest_doc.get('doc_id')}"
+    )
+    return newest_doc
 
 
 def process_live_workflow():
@@ -224,8 +473,14 @@ def process_live_workflow():
                 app_aktenzeichen = d3_client.get_aktenzeichen(location_url)
                 app_status_in_d3 = "UNBEKANNT"
 
+                # Шаг 1: Проверяем документ заявки в папке /009 с поиском по UUID
                 if app_aktenzeichen != "UNBEKANNT":
-                    app_files = search_antrag_files_in_d3(d3_client, app_aktenzeichen, app_akte_id)
+                    app_files = search_antrag_files_in_d3(
+                        d3_client,
+                        app_aktenzeichen,
+                        app_akte_id,
+                        item_uuid=linked_app_uuid
+                    )
                     parent_app_doc = find_specific_task_document(
                         docs=app_files,
                         target_folder_code=D3_FOLDER_APPLICATION,
@@ -234,9 +489,13 @@ def process_live_workflow():
                     if parent_app_doc:
                         app_status_in_d3 = parent_app_doc.get("vero_status_515", "UNBEKANNT")
 
+                # Шаг 2: Фоллбэк на статус родительской Акты, если в документе UNBEKANNT
+                if app_status_in_d3 == "UNBEKANNT":
+                    app_status_in_d3 = get_akte_status_in_d3(d3_client, location_url)
+
                 logging.info(t("PARENT_STATUS", status=app_status_in_d3))
 
-                if not is_final_approved(app_status_in_d3):
+                if not is_approval_status(app_status_in_d3):
                     logging.info(t("WAITING_PRAESIDIUM", app_uuid=linked_app_uuid, status=app_status_in_d3))
                     continue
 
@@ -258,7 +517,8 @@ def process_live_workflow():
                 pdf_groups_data=pdf_groups_structure,
                 output_filepath=pdf_filepath,
                 vero_id=vero_id,
-                title=project_title
+                title=project_title,
+                is_funding=is_funding
             )
 
             upload_success = False
@@ -267,7 +527,6 @@ def process_live_workflow():
                 akte_id = location_url.split("/")[-1].split("?")[0]
                 aktenzeichen = d3_client.get_aktenzeichen(location_url)
                 if aktenzeichen != "UNBEKANNT":
-                    vorgangszeichen = f"{aktenzeichen}/{folder_code}"
                     logging.info(t("UPLOADING_PDF", entity_type=entity_type, aktenzeichen=aktenzeichen,
                                    folder_name=folder_name, folder_code=folder_code))
                     doc_location = d3_client.upload_pdf_document(
@@ -324,64 +583,137 @@ def process_live_workflow():
 
             location_url = d3_client.find_akte_by_vero_id(target_uuid_for_akte)
             doc_status_in_d3 = "UNBEKANNT"
-            kostenstelle_val = ""
+            fonds_val = ""
+            finanzstelle_val = ""
 
             if location_url:
                 akte_id = location_url.split("/")[-1].split("?")[0]
                 aktenzeichen = d3_client.get_aktenzeichen(location_url)
-                if aktenzeichen != "UNBEKANNT":
-                    files = search_antrag_files_in_d3(d3_client, aktenzeichen, akte_id)
-                    target_folder_code = D3_FOLDER_FUNDING if is_funding else D3_FOLDER_APPLICATION
 
-                    # Интеллектуальный поиск документа задачи
-                    target_doc = find_specific_task_document(
-                        docs=files,
-                        target_folder_code=target_folder_code,
-                        item_uuid=vero_id,
-                        task_title=project_title
-                    )
+                # ==============================================================
+                # РАЗДЕЛЕНИЕ ЛОГИКИ: APPLICATION VS FUNDING
+                # ==============================================================
+                if not is_funding:
+                    # ДЛЯ APPLICATION:
+                    # Шаг 1: Ищем конкретный документ Meldebogen в папке /009 по UUID
+                    if aktenzeichen != "UNBEKANNT":
+                        files = search_antrag_files_in_d3(
+                            d3_client,
+                            aktenzeichen,
+                            akte_id,
+                            item_uuid=vero_id
+                        )
+                        target_doc = find_specific_task_document(
+                            docs=files,
+                            target_folder_code=D3_FOLDER_APPLICATION,
+                            item_uuid=vero_id,
+                            task_title=project_title
+                        )
+                        if target_doc:
+                            doc_status_in_d3 = target_doc.get("vero_status_515", "UNBEKANNT")
+                            logging.info(
+                                f"📄 Zugeordnetes d.3-Dokument: ID={target_doc.get('doc_id')} (Titel: '{target_doc.get('title')}', "
+                                f"Status={doc_status_in_d3})"
+                            )
 
-                    if target_doc:
-                        doc_status_in_d3 = target_doc.get("vero_status_515", "UNBEKANNT")
-                        kostenstelle_val = target_doc.get("kostenstelle", "")
-                        logging.info(f"📄 Zugeordnetes d.3-Dokument: ID={target_doc.get('doc_id')} (Titel: '{target_doc.get('title')}')")
-                    else:
-                        logging.warning(f"⚠️ d.3-Dokument für {entity_type} (Vero_ID={vero_id}) im Ordner {target_folder_code} noch nicht gefunden.")
+                    # Шаг 2: Фоллбэк на уровень Акты, если в документе статус UNBEKANNT
+                    if doc_status_in_d3 == "UNBEKANNT":
+                        doc_status_in_d3 = get_akte_status_in_d3(d3_client, location_url)
+                        logging.info(f"📊 Aktueller Aktenstatus [Application] in d.3 (Akte-Ebene, Feld 515): >>> {doc_status_in_d3} <<<")
 
-            status_clean = doc_status_in_d3.strip().lower()
+                else:
+                    # ДЛЯ FUNDING: Статус и реквизиты живут на уровне документа в /002!
+                    if aktenzeichen != "UNBEKANNT":
+                        files = search_antrag_files_in_d3(
+                            d3_client,
+                            aktenzeichen,
+                            akte_id,
+                            item_uuid=vero_id
+                        )
+                        target_doc = find_specific_task_document(
+                            docs=files,
+                            target_folder_code=D3_FOLDER_FUNDING,
+                            item_uuid=vero_id,
+                            task_title=project_title
+                        )
+
+                        if target_doc:
+                            doc_status_in_d3 = target_doc.get("vero_status_515", "UNBEKANNT")
+                            fonds_val = target_doc.get("fonds", "") or target_doc.get("kostenstelle", "")
+                            finanzstelle_val = target_doc.get("finanzstelle", "")
+                            logging.info(
+                                f"📄 Zugeordnetes d.3-Dokument: ID={target_doc.get('doc_id')} (Titel: '{target_doc.get('title')}', "
+                                f"Fonds='{fonds_val}', Finanzstelle='{finanzstelle_val}')"
+                            )
+                        else:
+                            logging.warning(f"⚠️ d.3-Dokument für Funding (Vero_ID={vero_id}) im Ordner {D3_FOLDER_FUNDING} noch nicht gefunden.")
+
             logging.info(t("DOC_STATUS_IN_D3", entity_type=entity_type,
                            folder_code=(D3_FOLDER_FUNDING if is_funding else D3_FOLDER_APPLICATION),
                            status=doc_status_in_d3))
 
             # ------------------------------------------------------------------
-            # Обработка успешных финальных статусов
+            # 1. ОБРАБОТКА ЯВНОГО СТАТУСНОГО ОТКЛОНЕНИЯ В d.3 (ВКЛЮЧАЯ VPPF_abgelehnt)
             # ------------------------------------------------------------------
-            if "praesidium_ja" in status_clean or "kostenstelle_vergeben" in status_clean:
-                if "kommentar" in status_clean or "auflagen" in status_clean:
-                    logging.info(t("APPROVED_WITH_COMMENT", entity_type=entity_type))
-                else:
-                    logging.info(t("APPROVED_SIMPLE", entity_type=entity_type))
+            if is_rejection_status(doc_status_in_d3):
+                logging.info(f"🚫 [ABGELEHNT] {entity_type} in d.3 DMS abgelehnt (Status: {doc_status_in_d3}).")
+                scanner.reject_claimed_task(
+                    claimedtask_id,
+                    reason=f"In d.3 DMS abgelehnt (Status: {doc_status_in_d3})."
+                )
 
-                # Обратная синхронизация Kostenstelle (только для Funding и только при валидном значении)
+            # ------------------------------------------------------------------
+            # 2. ОБРАБОТКА ЗАВЕРШЕНИЯ / ОДОБРЕНИЯ
+            # ------------------------------------------------------------------
+            elif is_approval_status(doc_status_in_d3):
                 if is_funding:
-                    if kostenstelle_val and is_valid_kostenstelle(kostenstelle_val):
-                        logging.info(f"🔢 Gefundene Kostenstelle in d.3: [{kostenstelle_val}]")
+                    valid_fonds = is_valid_kostenstelle(fonds_val)
+                    valid_finanzstelle = is_valid_kostenstelle(finanzstelle_val)
+
+                    if valid_fonds or valid_finanzstelle:
+                        sap_identifiers = []
+                        if valid_fonds:
+                            sap_identifiers.append(fonds_val)
+                        if valid_finanzstelle and finanzstelle_val not in sap_identifiers:
+                            sap_identifiers.append(finanzstelle_val)
+
+                        logging.info(f"🎉 [GENEHMIGT] Funding genehmigt mit SAP-Kennungen (Fonds/Finanzstelle): {sap_identifiers}")
                         item_target_uuid = item_info.get("uuid") or vero_id
-                        scanner.update_item_metadata_field(
+
+                        update_ok = update_dspace_internal_ids(
+                            scanner=scanner,
                             item_uuid=item_target_uuid,
-                            field_name=TARGET_DSPACE_KOSTENSTELLE_FIELD,
-                            value=kostenstelle_val
+                            id_values=sap_identifiers
                         )
+
+                        if update_ok:
+                            scanner.approve_claimed_task(claimedtask_id)
+                        else:
+                            logging.error(f"❌ Не удалось записать SAP-идентификаторы в DSpace. Задача {claimedtask_id} не утверждена.")
+
+                    elif is_explicit_rejection_value(fonds_val) or is_explicit_rejection_value(finanzstelle_val):
+                        logging.warning(
+                            f"🚫 [ABGELEHNT] Finanzdaten wurden in d.3 abgelehnt (Fonds: '{fonds_val}', Finanzstelle: '{finanzstelle_val}'). "
+                            f"Aufgabe wird in DSpace abgelehnt."
+                        )
+                        scanner.reject_claimed_task(
+                            claimedtask_id,
+                            reason=f"Abgelehnt: Finanzdaten in d.3 abgelehnt (Fonds: '{fonds_val}', Finanzstelle: '{finanzstelle_val}')."
+                        )
+
                     else:
-                        logging.warning(f"⚠️ Funding genehmigt, aber noch keine gültige Kostenstelle in d.3 gefunden.")
+                        logging.info(
+                            f"⏳ [WARTEN / IN BEARBEITUNG] Funding-Status in d.3 ist bereits '{doc_status_in_d3}', "
+                            f"jedoch sind Fonds ('{fonds_val}') und Finanzstelle ('{finanzstelle_val}') noch leer. "
+                            f"Warte auf Formularabschluss im d.3 DMS..."
+                        )
+                else:
+                    logging.info(f"🎉 [GENEHMIGT] Application erfolgreich vom Präsidium genehmigt!")
+                    scanner.approve_claimed_task(claimedtask_id)
 
-                scanner.approve_claimed_task(claimedtask_id)
-
-            # Обработка отклонения
-            elif "praesidium_nein" in status_clean:
-                logging.info(t("REJECTED", entity_type=entity_type))
-                scanner.reject_claimed_task(claimedtask_id, reason=t("REJECT_REASON"))
-
+            # ------------------------------------------------------------------
+            # 3. В ПРОЦЕССЕ СОГЛАСОВАНИЯ
+            # ------------------------------------------------------------------
             else:
                 logging.info(t("IN_PROGRESS", entity_type=entity_type, status=doc_status_in_d3))
     else:
@@ -405,6 +737,17 @@ def main():
             logging.info("\n" + t("CYCLE_START", count=cycle_count))
             try:
                 process_live_workflow()
+            except requests.exceptions.ConnectionError as err:
+                err_str = str(err).lower()
+                if "nameresolutionerror" in err_str or "getaddrinfo failed" in err_str:
+                    logging.error(
+                        f"❌ Netzwerkfehler im Zyklus #{cycle_count}: Keine Internetverbindung "
+                        f"oder DNS-Auflösung fehlgeschlagen (Host nicht erreichbar)."
+                    )
+                else:
+                    logging.error(
+                        f"❌ Verbindungsfehler im Zyklus #{cycle_count}: Serververbindung getrennt ({err})."
+                    )
             except Exception as e:
                 logging.error(t("CYCLE_EXCEPTION", count=cycle_count, e=e), exc_info=True)
 

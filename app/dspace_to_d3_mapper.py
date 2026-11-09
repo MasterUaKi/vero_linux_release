@@ -1,13 +1,13 @@
 # ==============================================================================
 # Script Name: dspace_to_d3_mapper.py
-# Version:     3.2.0
-# Date:        2026-08-18
+# Version:     3.5.0
+# Date:        2026-09-24
 # Author:      Oleh Riabtsev / AI Assistant
 # Description: Full field transformation module mapping DSpace-CRIS (VeRO)
 #              metadata to d.3 DMS properties payload and PDF generation schema.
-#              UPDATED: Added faculty name normalization (clean_faculty_name)
-#              and updated TYPE_CONFIG_MATRIX to strictly match d.3 DMS
-#              workflow routing requirements ('Fakultät I' / 'Fakultät II').
+#              UPDATED: Added clean_d3_amount for d.3 money/numeric properties
+#              (field 154) and replaced Cyrillic words in PDF labels with German
+#              'oder' to eliminate black glyph rectangles.
 # ==============================================================================
 
 import json
@@ -77,6 +77,88 @@ class DSpaceToD3Mapper:
 
         return val
 
+    @classmethod
+    def clean_d3_amount(cls, raw_amount: str) -> str:
+        """
+        Нормализует денежные и числовые суммы для полей d.3 DMS типа Money / Numeric (поле 154):
+        - '4.500.000' -> '4500000'
+        - '400.000 €' -> '400000'
+        - '1.250.000,50 EUR' -> '1250000.50'
+        - 'keine' -> ''
+        """
+        if not raw_amount:
+            return ""
+
+        val = str(raw_amount).strip()
+        if not val:
+            return ""
+
+        # Удаляем все символы кроме цифр, точек и запятых
+        val = re.sub(r"[^\d,\.]", "", val)
+        if not val:
+            return ""
+
+        # Если присутствуют и точки, и запятые (немецкий формат 1.250.000,50)
+        if "." in val and "," in val:
+            val = val.replace(".", "").replace(",", ".")
+        elif "," in val:
+            val = val.replace(",", ".")
+        elif "." in val:
+            parts = val.split(".")
+            # Если несколько точек (4.500.000) или одна точка с 3 знаками после (400.000)
+            if len(parts) > 2:
+                val = "".join(parts)
+            elif len(parts) == 2 and len(parts[1]) == 3:
+                val = "".join(parts)
+
+        try:
+            float(val)
+            return val
+        except ValueError:
+            return ""
+
+    @classmethod
+    def normalize_d3_date(cls, raw_date: str, is_end_date: bool = False) -> str:
+        """
+        Приводит дату к стандарту ISO (YYYY-MM-DD), требуемому d.3 DMS для полей типа 'Datum'.
+        """
+        if not raw_date:
+            return ""
+
+        val = str(raw_date).strip()
+        if not val:
+            return ""
+
+        # 1. Год (YYYY), например '2026'
+        if re.fullmatch(r"\d{4}", val):
+            return f"{val}-12-31" if is_end_date else f"{val}-01-01"
+
+        # 2. Год и месяц (YYYY-MM), например '2026-09'
+        if re.fullmatch(r"\d{4}-\d{2}", val):
+            year, month = val.split("-")
+            if is_end_date:
+                last_day = "31" if month in ["01", "03", "05", "07", "08", "10", "12"] else ("28" if month == "02" else "30")
+                return f"{year}-{month}-{last_day}"
+            return f"{val}-01"
+
+        # 3. Полный формат ISO: YYYY-MM-DD
+        iso_match = re.match(r"^(\d{4})-(\d{2})-(\d{2})", val)
+        if iso_match:
+            return f"{iso_match.group(1)}-{iso_match.group(2)}-{iso_match.group(3)}"
+
+        # 4. Немецкий формат: DD.MM.YYYY
+        de_match = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})", val)
+        if de_match:
+            day = int(de_match.group(1))
+            month = int(de_match.group(2))
+            year = de_match.group(3)
+            return f"{year}-{month:02d}-{day:02d}"
+
+        logging.warning(
+            f"Не удалось преобразовать значение даты '{val}' для d.3 DMS. Поле даты будет пропущено."
+        )
+        return ""
+
     @staticmethod
     def _truncate_for_d3(val: str, max_len: int = 250) -> str:
         if not val:
@@ -89,30 +171,84 @@ class DSpaceToD3Mapper:
         if key in metadata_dict:
             values = metadata_dict[key]
             if isinstance(values, list) and len(values) > 0:
-                return str(values[0]).strip()
+                first_item = values[0]
+                if isinstance(first_item, dict):
+                    return str(first_item.get("value", "")).strip()
+                return str(first_item).strip()
         key_lower = key.lower()
         for k, values in metadata_dict.items():
             if k.lower() == key_lower and isinstance(values, list) and len(values) > 0:
-                return str(values[0]).strip()
+                first_item = values[0]
+                if isinstance(first_item, dict):
+                    return str(first_item.get("value", "")).strip()
+                return str(first_item).strip()
         return default
+
+    @classmethod
+    def extract_parent_application_uuid(cls, dspace_item_details: dict) -> str:
+        """
+        Надежное извлечение UUID родительской Application из полей связи Funding в DSpace-CRIS.
+        Проверяет атрибуты 'authority' и 'value' для полей связи.
+        """
+        metadata = dspace_item_details.get("metadata", {})
+        candidate_keys = [
+            "veroFU.application",
+            "dc.relation.project",
+            "cris.relation.project",
+            "oairecerif.funding.application"
+        ]
+
+        for key in candidate_keys:
+            if key in metadata and metadata[key]:
+                values = metadata[key]
+                if isinstance(values, list) and len(values) > 0:
+                    entry = values[0]
+                    if isinstance(entry, dict):
+                        auth = str(entry.get("authority", "")).strip()
+                        if auth and len(auth) > 10:  # робустная проверка на UUID
+                            return auth
+                        val = str(entry.get("value", "")).strip()
+                        if val and len(val) > 10:
+                            return val
+                    elif isinstance(entry, str):
+                        s = entry.strip()
+                        if s:
+                            return s
+
+        for k, values in metadata.items():
+            if "application" in k.lower() or "relation" in k.lower():
+                if isinstance(values, list) and len(values) > 0:
+                    entry = values[0]
+                    if isinstance(entry, dict):
+                        auth = str(entry.get("authority", "")).strip()
+                        if auth and len(auth) > 10:
+                            return auth
+                        val = str(entry.get("value", "")).strip()
+                        if val and len(val) > 10:
+                            return val
+
+        return ""
 
     @staticmethod
     def _extract_all(metadata_dict: dict, key: str) -> list:
         key_lower = key.lower()
         for k, values in metadata_dict.items():
             if k.lower() == key_lower and isinstance(values, list):
-                return [str(v).strip() for v in values if str(v).strip()]
+                res = []
+                for v in values:
+                    if isinstance(v, dict):
+                        val = str(v.get("value", "")).strip()
+                        if val:
+                            res.append(val)
+                    else:
+                        s = str(v).strip()
+                        if s:
+                            res.append(s)
+                return res
         return []
 
     @classmethod
     def build_aktenplanzeichen(cls, dspace_item_details: dict) -> str:
-        """
-        Динамическое формирование Aktenplanzeichen:
-        - Antragsforschung: 11.01.0.[JAHR]
-        - Auftragsforschung: 11.01.1.[JAHR]
-        - Wissenschaftliche Weiterbildung: 11.01.2.[JAHR]
-        - Sonstige betriebliche Erträge: 11.01.3.[JAHR]
-        """
         metadata = dspace_item_details.get("metadata", {})
 
         funding_type = (
@@ -213,13 +349,16 @@ class DSpaceToD3Mapper:
         }
 
         if is_funding:
+            raw_start = cls._extract_first(metadata, "oairecerif.funding.startDate", "")
+            raw_end = cls._extract_first(metadata, "oairecerif.funding.endDate", "")
+
             fields.update({
                 "title": cls._extract_first(metadata, "dc.title", "Unbenannter Funding-Eintrag"),
                 "acronym": cls._extract_first(metadata, "oairecerif.acronym", ""),
                 "project_type": cls._extract_first(metadata, "veroFU.project.type", ""),
                 "project_purpose": cls._extract_first(metadata, "veroFU.project.purpose", ""),
-                "funding_start": cls._extract_first(metadata, "oairecerif.funding.startDate", ""),
-                "funding_end": cls._extract_first(metadata, "oairecerif.funding.endDate", ""),
+                "funding_start": cls.normalize_d3_date(raw_start, is_end_date=False),
+                "funding_end": cls.normalize_d3_date(raw_end, is_end_date=True),
 
                 "investigator": cls._extract_first(metadata, "veroFU.scientificLeader", ""),
                 "org_unit": cls._extract_first(metadata, "vero.OrgUnit", ""),
@@ -254,13 +393,16 @@ class DSpaceToD3Mapper:
                 "embargo_lift": cls._extract_first(metadata, "veroFU.embargo.lift", ""),
             })
         else:
+            raw_start = cls._extract_first(metadata, "veroAP.funding.start", "")
+            raw_end = cls._extract_first(metadata, "veroAP.funding.end", "")
+
             fields.update({
                 "title": cls._extract_first(metadata, "dc.title", "Unbenannter Antrag"),
                 "acronym": cls._extract_first(metadata, "veroAP.acronym", ""),
                 "project_type": cls._extract_first(metadata, "veroAP.project.type", ""),
                 "project_purpose": cls._extract_first(metadata, "veroAP.project.purpose", ""),
-                "funding_start": cls._extract_first(metadata, "veroAP.funding.start", ""),
-                "funding_end": cls._extract_first(metadata, "veroAP.funding.end", ""),
+                "funding_start": cls.normalize_d3_date(raw_start, is_end_date=False),
+                "funding_end": cls.normalize_d3_date(raw_end, is_end_date=True),
 
                 "fak_i_unit": cls._extract_first(metadata, "veroAP.organizationUnit.FakI", ""),
                 "org_unit": cls._extract_first(metadata, "vero.OrgUnit", ""),
@@ -339,7 +481,7 @@ class DSpaceToD3Mapper:
             optional_fields = [
                 ("109", ds_fields["title"]),
                 ("149", ds_fields["investigator"]),
-                ("154", ds_fields["amount_granted"]),
+                ("154", cls.clean_d3_amount(ds_fields["amount_granted"])),
                 ("153", ds_fields["funding_funder"]),
                 ("284", ds_fields["funding_start"]),
                 ("285", ds_fields["funding_end"]),
@@ -350,7 +492,7 @@ class DSpaceToD3Mapper:
             optional_fields = [
                 ("109", ds_fields["title"]),
                 ("149", ds_fields["investigator"]),
-                ("154", ds_fields["funding_amount"]),
+                ("154", cls.clean_d3_amount(ds_fields["funding_amount"])),
                 ("153", ds_fields["funding_funder"]),
                 ("284", ds_fields["funding_start"]),
                 ("285", ds_fields["funding_end"]),
@@ -507,7 +649,7 @@ class DSpaceToD3Mapper:
                         {"label": "Querschnittsthema", "value": ds["crosssection_subject"]},
                         {"label": "Anderer Schwerpunkt/ weiteres Thema oder Fachgebiet", "value": ds["subject_other"]},
                         {"label": "Projektbeschreibung", "value": ds["abstract"]},
-                        {"label": "Erhebung personen- или gesundheitsbezogene Daten",
+                        {"label": "Erhebung personen- oder gesundheitsbezogene Daten",
                          "value": ds["personell_health_data"]}
                     ]
                 },
