@@ -26,7 +26,7 @@ poll_interval_seconds = 60
 language = de
 
 [LOGGING]
-log_dir = logs
+log_dir = /opt/vero-integration/logs
 log_filename = vero_integration.log
 backup_count = 30
 
