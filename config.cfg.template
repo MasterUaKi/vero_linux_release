@@ -22,7 +22,7 @@ aufbewahrungsfrist = 120
 vero_status = Antrag_eingegangen
 
 [SETTINGS]
-poll_interval_seconds = 360
+poll_interval_seconds = 60
 language = de
 
 [LOGGING]
